@@ -1,0 +1,898 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>open-fog · backfill your Fog of World map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin="" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&display=swap" />
+  <style>
+    :root {
+      --canvas: #fffefb;
+      --canvas-soft: #f8f4f0;
+      --ink: #201515;
+      --ink-soft: #2f2a26;
+      --body: #605d52;
+      --body-mid: #939084;
+      --mute: #c5c0b1;
+      --primary: #ff4f00;
+      --on-primary: #fffefb;
+      --err-bg: rgba(255, 79, 0, 0.08);
+      --err-border: rgba(255, 79, 0, 0.35);
+      --err-fg: #7a2e1e;
+      --font-sans: 'Geist', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    }
+    html { color-scheme: light; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font: 400 16px/1.5 var(--font-sans);
+      color: var(--ink); background: var(--canvas); min-height: 100svh;
+      -webkit-font-smoothing: antialiased;
+    }
+    .layout {
+      max-width: 1100px; margin: 0 auto; padding: 48px 24px 64px;
+      display: flex; flex-direction: column; gap: 24px;
+    }
+    h1 {
+      font: 600 clamp(32px, 5vw, 44px)/1 var(--font-sans);
+      letter-spacing: -0.03em;
+      color: var(--ink);
+    }
+    .lead {
+      margin-top: 14px;
+      font-size: 19px; line-height: 1.4;
+      letter-spacing: -0.01em; color: var(--ink-soft);
+      max-width: 52ch;
+    }
+    .lead em { font-style: normal; color: var(--primary); }
+    header p.muted {
+      margin-top: 6px;
+      font-size: 14px; line-height: 1.5;
+      max-width: 60ch;
+    }
+    .muted { color: var(--body-mid); }
+    .small { font-size: 14px; line-height: 1.5; }
+    .panel {
+      background: var(--canvas-soft);
+      border-radius: 12px; padding: 24px;
+    }
+    label {
+      display: inline-block;
+      font-weight: 500; font-size: 12px; line-height: 1;
+      letter-spacing: 0.08em; text-transform: uppercase;
+      color: var(--ink);
+    }
+    input {
+      width: 100%; padding: 12px 16px;
+      border: 1px solid var(--ink); border-radius: 6px;
+      font: 400 16px/1.5 var(--font-sans);
+      background: var(--canvas); color: var(--ink);
+    }
+    input:focus { outline: 2px solid var(--primary); outline-offset: -1px; border-color: var(--primary); }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .row > * { flex: 1 1 0; min-width: 10rem; }
+    .picker {
+      list-style: none; padding: 0; margin: 8px 0 0;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .picker li { position: relative; }
+    .picker li button {
+      width: 100%; text-align: left;
+      padding: 12px 16px;
+      background: var(--canvas); color: var(--ink);
+      border: 1px solid var(--ink); border-radius: 6px;
+      cursor: pointer; font: inherit;
+      transition: background-color 0.1s ease, border-color 0.1s ease;
+    }
+    .picker li button:hover { background: var(--canvas-soft); }
+    .picker li button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .picker li.selected button {
+      border-color: var(--primary);
+      background: rgba(255, 79, 0, 0.06);
+    }
+    .picker li.loading button { opacity: 0.6; }
+    .picker .route { font-weight: 600; font-size: 16px; color: var(--ink); }
+    .picker .meta {
+      font-size: 14px; line-height: 1.5; color: var(--body); margin-top: 4px;
+    }
+    .picker .meta a, .fr24-link {
+      color: var(--ink); text-decoration: underline; text-underline-offset: 2px;
+    }
+    .picker .meta a:hover, .fr24-link:hover { color: var(--primary); }
+    .fr24-link { font-size: 14px; margin-left: 4px; }
+    button.primary {
+      align-self: flex-start;
+      padding: 12px 22px;
+      background: var(--primary); color: var(--on-primary);
+      border: none; border-radius: 6px; cursor: pointer;
+      font: 500 14px/1.2 var(--font-sans);
+      letter-spacing: -0.005em;
+      transition: filter 0.1s ease;
+    }
+    button.primary:hover { filter: brightness(0.95); }
+    button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .hint { font-size: 14px; line-height: 1.5; color: var(--body); }
+    .hint a {
+      color: var(--ink); cursor: pointer;
+      text-decoration: underline; text-underline-offset: 2px;
+    }
+    .hint a:hover { color: var(--primary); }
+    .error {
+      margin-top: 16px; padding: 12px 16px;
+      background: var(--err-bg); border: 1px solid var(--err-border);
+      color: var(--err-fg); border-radius: 6px;
+      white-space: pre-wrap; font-size: 14px; line-height: 1.5;
+    }
+    .result-head {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; flex-wrap: wrap; margin-bottom: 16px;
+    }
+    .callsign {
+      font: 600 24px/1.2 var(--font-sans);
+      letter-spacing: -0.02em; color: var(--ink);
+    }
+    .map { height: 480px; border-radius: 12px; overflow: hidden; }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: var(--canvas-soft); padding: 2px 6px; border-radius: 4px;
+      font-size: 0.9em; color: var(--ink);
+    }
+    .tabs {
+      display: flex; gap: 4px;
+      border-bottom: 1px solid var(--mute);
+      margin-bottom: -1px;
+    }
+    .tab {
+      padding: 10px 20px;
+      background: transparent;
+      border: 1px solid transparent; border-bottom: none;
+      border-top-left-radius: 10px; border-top-right-radius: 10px;
+      cursor: pointer;
+      font: 500 14px/1.2 var(--font-sans);
+      letter-spacing: -0.005em;
+      color: var(--body-mid);
+      transition: color 0.1s ease;
+    }
+    .tab:hover { color: var(--ink); }
+    .tab[aria-selected="true"] {
+      background: var(--canvas-soft);
+      border-color: var(--mute);
+      color: var(--ink);
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    .panel.tabbed { border-top-left-radius: 0; border-top-right-radius: 0; }
+    .rail-pin {
+      width: 24px; height: 24px;
+      border-radius: 50%;
+      border: 2px solid var(--ink);
+      display: flex; align-items: center; justify-content: center;
+      font: 600 12px/1 var(--font-sans);
+      color: var(--on-primary);
+    }
+    .rail-pin-from { background: var(--ink); }
+    .rail-pin-to { background: var(--primary); }
+    .combobox-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+      align-items: end;
+    }
+    @media (max-width: 640px) {
+      .combobox-grid { grid-template-columns: 1fr; }
+    }
+    .combobox { position: relative; margin-top: 8px; }
+    .combobox.picked input { border-color: var(--primary); }
+    .combobox.picked::after {
+      content: '✓'; position: absolute; right: 12px; top: 50%;
+      transform: translateY(-50%); color: var(--primary);
+      font-weight: 700; pointer-events: none;
+    }
+    .suggestions {
+      position: absolute; z-index: 10;
+      top: calc(100% + 4px); left: 0; right: 0;
+      list-style: none; margin: 0; padding: 4px;
+      background: var(--canvas);
+      border: 1px solid var(--ink); border-radius: 6px;
+      max-height: 280px; overflow-y: auto;
+      box-shadow: 0 4px 12px rgba(32, 21, 21, 0.08);
+    }
+    .suggestions li {
+      padding: 8px 12px; border-radius: 4px; cursor: pointer;
+      transition: background-color 0.05s ease;
+    }
+    .suggestions li.active { background: var(--canvas-soft); }
+    .suggestions .sg-name { font-weight: 600; color: var(--ink); font-size: 16px; line-height: 1.5; }
+    .suggestions .sg-meta {
+      font-size: 14px; line-height: 1.4; color: var(--body); margin-top: 2px;
+      display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+    }
+    .suggestions .sg-meta a {
+      color: var(--body); text-decoration: underline; text-underline-offset: 2px;
+    }
+    .suggestions .sg-meta a:hover { color: var(--primary); }
+    .suggestions .sg-info {
+      padding: 10px 12px; font-size: 14px; color: var(--body-mid);
+      display: flex; align-items: center; gap: 8px;
+    }
+    .spinner {
+      width: 12px; height: 12px; border-radius: 50%;
+      border: 2px solid var(--mute); border-top-color: var(--primary);
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <header>
+      <h1>open-fog</h1>
+      <p class="lead">Backfill your <em>Fog of World</em> map.</p>
+      <p class="muted">Pull a flight or rail track, export it as a Fog of World-compatible KML.</p>
+    </header>
+
+    <div>
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" aria-selected="true" data-tab="flights">Flights</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="trains">Trains</button>
+      </div>
+
+      <section class="panel tabbed tab-panel active" id="tab-flights" role="tabpanel">
+        <form id="flight-form">
+          <label>Flight number + UTC date</label>
+          <div class="row" style="margin-top:0.4rem">
+            <input id="flight-input" type="text" placeholder="QF12" />
+            <input id="date-input" type="date" />
+          </div>
+          <button class="primary" type="submit" data-action="lookup" disabled style="margin-top:16px">Look up &amp; convert</button>
+          <p class="hint" style="margin-top:8px">Scrapes the FR24 history page (free tier: last ~7 days). UTC date — for late-night east-Asia departures, pick the day FR24 sees, not your local one.</p>
+        </form>
+        <div id="error" class="error" hidden></div>
+        <div id="picker" hidden>
+          <p id="picker-hint" class="hint" style="margin-top:1rem"></p>
+          <ul id="picker-list" class="picker"></ul>
+        </div>
+      </section>
+
+      <section class="panel tabbed tab-panel" id="tab-trains" role="tabpanel">
+        <form id="rail-form" autocomplete="off">
+          <div class="combobox-grid">
+            <div>
+              <label for="rail-from">From station</label>
+              <div class="combobox" id="rail-from-combo">
+                <input id="rail-from" type="text" placeholder="Start typing… e.g. New York Penn" autocomplete="off"
+                       role="combobox" aria-autocomplete="list" aria-controls="rail-from-suggestions" aria-expanded="false" />
+                <ul class="suggestions" id="rail-from-suggestions" role="listbox" hidden></ul>
+              </div>
+            </div>
+            <div>
+              <label for="rail-to">To station</label>
+              <div class="combobox" id="rail-to-combo">
+                <input id="rail-to" type="text" placeholder="Start typing… e.g. Washington Union" autocomplete="off"
+                       role="combobox" aria-autocomplete="list" aria-controls="rail-to-suggestions" aria-expanded="false" />
+                <ul class="suggestions" id="rail-to-suggestions" role="listbox" hidden></ul>
+              </div>
+            </div>
+          </div>
+          <button class="primary" type="button" data-action="rail-route" disabled style="margin-top:16px">Route &amp; convert</button>
+          <p class="hint" style="margin-top:8px">Station suggestions via <a href="https://photon.komoot.io/" target="_blank" rel="noopener">Photon</a> (OSM). Pick one for each, then route — the <em>Railway lines</em> overlay is on by default so you can sanity-check coverage.</p>
+        </form>
+        <div id="rail-error" class="error" hidden></div>
+      </section>
+    </div>
+
+    <section class="panel" id="flight-map-panel" hidden>
+      <header class="result-head" id="flight-result-head" hidden>
+        <div>
+          <div class="callsign" id="flight-callsign"></div>
+          <div class="muted" id="flight-meta"></div>
+          <div class="muted small" id="flight-fr24"></div>
+        </div>
+        <button class="primary" id="flight-download-btn">Download KML</button>
+      </header>
+      <div id="flight-map" class="map"></div>
+    </section>
+
+    <section class="panel" id="rail-map-panel" hidden>
+      <header class="result-head" id="rail-result-head" hidden>
+        <div>
+          <div class="callsign" id="rail-callsign"></div>
+          <div class="muted" id="rail-meta"></div>
+        </div>
+        <button class="primary" id="rail-download-btn">Download KML</button>
+      </header>
+      <div id="rail-map" class="map"></div>
+    </section>
+
+    <footer class="muted">
+    </footer>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+          crossorigin=""></script>
+  <script>
+    const $ = (sel) => document.querySelector(sel);
+    const $$ = (sel) => document.querySelectorAll(sel);
+    const errBox = $('#error');
+    let currentFlightNumber = '';
+    // Monotonic id of the most recently dispatched /api/track request. Used to
+    // discard stale responses when the user clicks multiple legs rapidly.
+    let activeTrackRequest = 0;
+
+    // Each tab owns its own Leaflet map, track layer, and downloadable KML so
+    // switching tabs never leaks state across modes.
+    const flight = { map: null, trackLayer: null, kml: null, filename: null, hasData: false };
+    const rail   = { map: null, trackLayer: null, railOverlay: null, kml: null, filename: null, hasData: false };
+
+    function activeTab() {
+      return $('.tab[aria-selected="true"]').dataset.tab;
+    }
+    function syncMapPanelVisibility() {
+      $('#flight-map-panel').hidden = !(flight.hasData && activeTab() === 'flights');
+      $('#rail-map-panel').hidden   = !(rail.hasData   && activeTab() === 'trains');
+    }
+
+    // Default the date input to today (UTC) on page load.
+    $('#date-input').value = new Date().toISOString().slice(0, 10);
+
+    function fr24Url(flightNumber, flightId) {
+      // Canonical playback URL is path-based; the fragment form just opens
+      // the history-list page (verified against FR24's <link rel="canonical">).
+      const num = (flightNumber || '').toLowerCase();
+      return `https://www.flightradar24.com/data/flights/${num}/${flightId}`;
+    }
+
+    function showError(msg) {
+      errBox.textContent = msg;
+      errBox.hidden = false;
+      $('#flight-result-head').hidden = true;
+    }
+    function clearError() { errBox.hidden = true; errBox.textContent = ''; }
+
+    function ensureFlightMap() {
+      flight.hasData = true;
+      syncMapPanelVisibility();
+      if (flight.map) return;
+      flight.map = L.map('flight-map', { worldCopyJump: true, preferCanvas: true }).setView([20, 0], 2);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        maxZoom: 19,
+      }).addTo(flight.map);
+      flight.trackLayer = L.layerGroup().addTo(flight.map);
+    }
+
+    function ensureRailMap() {
+      rail.hasData = true;
+      syncMapPanelVisibility();
+      if (rail.map) return;
+      rail.map = L.map('rail-map', { worldCopyJump: true, preferCanvas: true }).setView([20, 0], 2);
+      const osmBase = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        maxZoom: 19,
+      }).addTo(rail.map);
+      rail.railOverlay = L.tileLayer('https://{s}.tiles.openrailwaymap.org/standard/{z}/{x}/{y}.png', {
+        attribution: '&copy; <a href="https://www.openrailwaymap.org/">OpenRailwayMap</a>',
+        maxZoom: 19, opacity: 0.85,
+      }).addTo(rail.map);
+      L.control.layers({ 'OpenStreetMap': osmBase }, { 'Railway lines (OpenRailwayMap)': rail.railOverlay }).addTo(rail.map);
+      rail.trackLayer = L.layerGroup().addTo(rail.map);
+    }
+
+    function renderResult(res, candidate) {
+      // Guard before mutating any rendering state — kml.Convert can return
+      // legs with empty airborne (pre-departure, taxi-only playbacks). Raw
+      // raw[0] dereference below would otherwise crash and leave the UI
+      // stuck on 'Working…' with stale flight.kml/filename armed.
+      if (!res.airborne || res.airborne.length === 0) {
+        throw new Error('No airborne playback samples for this leg — FR24 has nothing to render.');
+      }
+      flight.kml = res.kml;
+      flight.filename = res.filename;
+      const code = (a) => a.iata || a.icao;
+      $('#flight-callsign').textContent = res.callsign;
+      $('#flight-meta').textContent = `${code(res.origin)} → ${code(res.destination)} · ${res.airborne.length} airborne points`;
+      const fr24 = $('#flight-fr24');
+      if (candidate) {
+        const url = fr24Url(currentFlightNumber, candidate.flightId);
+        fr24.innerHTML = `<a class="fr24-link" href="${url}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">open on flightradar24 ↗</a>`;
+      } else {
+        fr24.innerHTML = '';
+      }
+      $('#flight-download-btn').textContent = `Download ${res.filename}`;
+      $('#flight-result-head').hidden = false;
+      ensureFlightMap();
+      // Force Leaflet to recompute the now-visible map size.
+      setTimeout(() => flight.map.invalidateSize(), 0);
+      flight.trackLayer.clearLayers();
+
+      // Unwrap longitudes across the antimeridian. Without this, transpacific
+      // flights (LAX→SYD etc.) render as a horizontal line through Africa
+      // because Leaflet draws the long way around when consecutive points
+      // jump >180° in longitude.
+      const raw = res.airborne;
+      const pts = [[raw[0].latitude, raw[0].longitude]];
+      for (let i = 1; i < raw.length; i++) {
+        let lng = raw[i].longitude;
+        const prev = pts[i - 1][1];
+        while (lng - prev > 180) lng -= 360;
+        while (lng - prev < -180) lng += 360;
+        pts.push([raw[i].latitude, lng]);
+      }
+      // Snap an airport's longitude to the world copy nearest a reference.
+      const snap = (refLng, lng) => {
+        while (lng - refLng > 180) lng -= 360;
+        while (lng - refLng < -180) lng += 360;
+        return lng;
+      };
+
+      const line = L.polyline(pts, { color: '#ff4f00', weight: 3, opacity: 0.9 }).addTo(flight.trackLayer);
+      const pin = (lat, lng, label) => L.circleMarker([lat, lng], {
+        radius: 7, color: '#201515', weight: 2, fillColor: '#fffefb', fillOpacity: 1,
+      }).bindPopup(label).addTo(flight.trackLayer);
+      const oLng = snap(pts[0][1], res.origin.longitude);
+      const dLng = snap(pts[pts.length - 1][1], res.destination.longitude);
+      pin(res.origin.latitude, oLng,
+        `<b>${escapeHtml(res.origin.iata || res.origin.icao)}</b> ${escapeHtml(res.origin.name)}`);
+      pin(res.destination.latitude, dLng,
+        `<b>${escapeHtml(res.destination.iata || res.destination.icao)}</b> ${escapeHtml(res.destination.name)}`);
+      line.bindPopup(`${escapeHtml(res.callsign)}: ${res.airborne.length} points`);
+      flight.map.fitBounds(line.getBounds(), { padding: [40, 40] });
+    }
+
+    // Format a unix timestamp at a specific UTC offset as "HH:MM".
+    function localHHMM(unix, offsetSec) {
+      const d = new Date((unix + (offsetSec || 0)) * 1000);
+      return d.getUTCHours().toString().padStart(2, '0') + ':' +
+             d.getUTCMinutes().toString().padStart(2, '0');
+    }
+
+    async function fetchAndRender(c) {
+      const reqId = ++activeTrackRequest;
+      const resp = await fetch(`/api/track?flightId=${encodeURIComponent(c.flightId)}&timestamp=${c.timestamp}`);
+      // If the user clicked another leg after this fetch started, drop the
+      // stale response so it doesn't overwrite the now-current selection.
+      if (reqId !== activeTrackRequest) return;
+      const data = await resp.json();
+      if (reqId !== activeTrackRequest) return;
+      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+      renderResult(data, c);
+    }
+
+    function showPicker(candidates) {
+      const list = $('#picker-list');
+      list.innerHTML = '';
+      $('#picker-hint').textContent = candidates.length > 1
+        ? 'Multiple legs share this flight number on this date. Pick one:'
+        : 'Leg found:';
+      for (const c of candidates) {
+        const li = document.createElement('li');
+        const b = document.createElement('button');
+        b.type = 'button';
+        const route = `${escapeHtml(c.fromIATA || '?')} → ${escapeHtml(c.toIATA || '?')}`;
+        const cities = (c.fromCity && c.toCity)
+          ? ` (${escapeHtml(c.fromCity)} → ${escapeHtml(c.toCity)})`
+          : '';
+        const url = fr24Url(currentFlightNumber, c.flightId);
+        b.innerHTML = `
+          <div class="route">${route}${cities}</div>
+          <div class="meta">
+            STD ${escapeHtml(localHHMM(c.timestamp, c.offsetSec))} local · flightId ${escapeHtml(String(c.flightId))}
+            ${c.hasATD ? '' : ' · <em>not yet departed — no playback</em>'}
+          </div>`;
+        b.disabled = !c.hasATD;
+        b.addEventListener('click', async () => {
+          // Mark this row as the selected one; clear any prior selection.
+          for (const sib of list.querySelectorAll('li')) sib.classList.remove('selected');
+          li.classList.add('selected', 'loading');
+          try { await fetchAndRender(c); }
+          catch (e) { showError(e.message); }
+          finally { li.classList.remove('loading'); }
+        });
+        li.appendChild(b);
+        // Separate FR24 link so a click on it doesn't trigger the button.
+        const linkRow = document.createElement('div');
+        linkRow.className = 'meta';
+        linkRow.style.padding = '0 0.85rem 0.4rem';
+        linkRow.innerHTML = `<a href="${encodeURI(url)}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">open on flightradar24 ↗</a>`;
+        li.appendChild(linkRow);
+        list.appendChild(li);
+      }
+      $('#picker').hidden = false;
+    }
+
+    let isLookupLoading = false;
+    async function lookup() {
+      clearError();
+      $('#picker').hidden = true;
+      $('#flight-result-head').hidden = true;
+      const btn = document.querySelector('[data-action="lookup"]');
+      isLookupLoading = true;
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = 'Working…';
+      try {
+        const num = $('#flight-input').value.trim();
+        const date = $('#date-input').value;
+        if (!num || !date) throw new Error('Both flight number and date are required');
+        currentFlightNumber = num;
+        const resp = await fetch(`/api/candidates?flight=${encodeURIComponent(num)}&date=${date}`);
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        const cs = data.candidates || [];
+        if (cs.length === 0) {
+          throw new Error('No legs found.');
+        }
+        // Always render the picker so the user can switch legs and see the
+        // FR24 URL — even for single-leg results.
+        showPicker(cs);
+        if (cs.length === 1) {
+          // Auto-convert the only leg, and mark it selected in the picker.
+          const li = $('#picker-list').querySelector('li');
+          if (li) li.classList.add('selected', 'loading');
+          try { await fetchAndRender(cs[0]); }
+          finally { if (li) li.classList.remove('loading'); }
+        }
+      } catch (e) {
+        showError(e.message);
+      } finally {
+        isLookupLoading = false;
+        btn.textContent = original;
+        syncLookupButton();
+      }
+    }
+    $('#flight-form').addEventListener('submit', (e) => { e.preventDefault(); lookup(); });
+
+    // Mirror the Trains tab pattern: the primary CTA stays disabled until the
+    // inputs that the request actually needs are present. Avoids the
+    // "click → see required-field error" detour and keeps the two tabs
+    // visually consistent on first load. Bail while a lookup is in flight so
+    // the input listener can't re-enable the button mid-fetch and let the
+    // user issue a concurrent submit.
+    function syncLookupButton() {
+      if (isLookupLoading) return;
+      const num = $('#flight-input').value.trim();
+      const date = $('#date-input').value;
+      document.querySelector('[data-action="lookup"]').disabled = !(num && date);
+    }
+    $('#flight-input').addEventListener('input', syncLookupButton);
+    $('#date-input').addEventListener('input', syncLookupButton);
+    $('#date-input').addEventListener('change', syncLookupButton);
+    syncLookupButton();
+
+    function downloadKml(state) {
+      return () => {
+        if (!state.kml) return;
+        const blob = new Blob([state.kml], { type: 'application/vnd.google-earth.kml+xml' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = state.filename;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 0);
+      };
+    }
+    $('#flight-download-btn').addEventListener('click', downloadKml(flight));
+    $('#rail-download-btn').addEventListener('click', downloadKml(rail));
+
+    // --- Tabs ---
+    for (const tab of $$('.tab')) {
+      tab.addEventListener('click', () => {
+        for (const t of $$('.tab')) t.setAttribute('aria-selected', String(t === tab));
+        for (const p of $$('.tab-panel')) p.classList.toggle('active', p.id === `tab-${tab.dataset.tab}`);
+        // Invalidate any in-flight /api/track fetch so its renderResult
+        // can't quietly write to flight state after the user navigated
+        // away — otherwise a "phantom" track shows up next time the user
+        // returns to Flights. Same guard the leg-click loop already uses.
+        activeTrackRequest++;
+        // Also clear any stale errors from the other tab so re-entering
+        // doesn't resurface unrelated messages.
+        clearError();
+        clearRailError();
+        syncMapPanelVisibility();
+      });
+    }
+
+    // --- Trains ---
+    const railErr = $('#rail-error');
+    function showRailError(msg) {
+      railErr.textContent = msg;
+      railErr.hidden = false;
+      $('#rail-result-head').hidden = true;
+    }
+    function clearRailError() { railErr.hidden = true; railErr.textContent = ''; }
+
+    // Confirmed picks for the two stations; null until the user (or auto-pick)
+    // selects one from the candidate list.
+    const railPick = { from: null, to: null };
+    // Persistent map markers for the two picks, so swapping picks moves the
+    // pin instead of dropping a second one.
+    const railPinLayer = { from: null, to: null };
+
+    function osmHref(s) {
+      const type = ({ N: 'node', W: 'way', R: 'relation' })[s.osmType] || 'node';
+      return { type, url: `https://www.openstreetmap.org/${type}/${s.osmId}` };
+    }
+
+    // Remove the side's pin from the rail map if one is currently drawn.
+    // Called when the user edits a previously-picked input so the visual
+    // doesn't show a committed pick the form no longer represents.
+    function clearPin(side) {
+      if (railPinLayer[side] && rail.trackLayer) {
+        rail.trackLayer.removeLayer(railPinLayer[side]);
+      }
+      railPinLayer[side] = null;
+    }
+
+    function railStationPin(side, station) {
+      ensureRailMap();
+      if (railPinLayer[side]) rail.trackLayer.removeLayer(railPinLayer[side]);
+      // Letter + color together so the From/To distinction survives both
+      // colorblind viewers and grayscale screenshots.
+      const letter = side === 'from' ? 'A' : 'B';
+      const icon = L.divIcon({
+        className: '',
+        html: `<div class="rail-pin rail-pin-${side}">${letter}</div>`,
+        iconSize: [24, 24],
+        iconAnchor: [12, 12],
+      });
+      const ref = osmHref(station);
+      railPinLayer[side] = L.marker([station.latitude, station.longitude], { icon, title: station.name })
+        .bindPopup(`<b>${escapeHtml(station.name)}</b><br>${side.toUpperCase()} · ${ref.type} ${station.osmId}`)
+        .addTo(rail.trackLayer);
+    }
+
+    function fitToPicks() {
+      const pts = [];
+      if (railPick.from) pts.push([railPick.from.latitude, railPick.from.longitude]);
+      if (railPick.to) pts.push([railPick.to.latitude, railPick.to.longitude]);
+      if (pts.length === 0) return;
+      if (pts.length === 1) {
+        rail.map.setView(pts[0], 12);
+      } else {
+        rail.map.fitBounds(L.latLngBounds(pts), { padding: [60, 60] });
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s ?? '').replace(/[&<>"']/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+    function debounce(fn, ms) {
+      let t;
+      const wrapper = function (...args) {
+        clearTimeout(t);
+        t = setTimeout(() => fn.apply(this, args), ms);
+      };
+      wrapper.cancel = () => clearTimeout(t);
+      return wrapper;
+    }
+
+    function setupStationCombobox(side) {
+      const input = $(`#rail-${side}`);
+      const combo = $(`#rail-${side}-combo`);
+      const list = $(`#rail-${side}-suggestions`);
+      // Cached responses by query, so retyping the same prefix never re-hits
+      // Photon. Survives only for this tab session — fine for typeahead.
+      const cache = new Map();
+      let activeIdx = -1;
+      let currentResults = [];
+      // Monotonic id of the most recently dispatched search. Used to discard
+      // a stale Photon response if the user kept typing after it left.
+      let reqId = 0;
+
+      function close() {
+        list.hidden = true;
+        input.setAttribute('aria-expanded', 'false');
+        activeIdx = -1;
+        // Bump reqId AND cancel any pending debounce so a still-in-flight or
+        // about-to-fire Photon response can't reopen the dropdown after the
+        // user picked / cleared / blurred.
+        reqId++;
+        doSearch.cancel();
+      }
+      function setActive(idx) {
+        const items = list.querySelectorAll('li[data-idx]');
+        items.forEach(el => el.classList.remove('active'));
+        activeIdx = idx;
+        if (idx >= 0 && idx < items.length) {
+          items[idx].classList.add('active');
+          items[idx].scrollIntoView({ block: 'nearest' });
+        }
+      }
+      function render(stations) {
+        list.innerHTML = '';
+        currentResults = stations;
+        if (stations.length === 0) {
+          const li = document.createElement('li');
+          li.className = 'sg-info';
+          li.textContent = 'No stations matched. Try a different spelling, or include the city.';
+          list.appendChild(li);
+        } else {
+          stations.forEach((s, i) => {
+            const li = document.createElement('li');
+            li.dataset.idx = String(i);
+            li.setAttribute('role', 'option');
+            const ref = osmHref(s);
+            const region = s.region
+              ? `<span>${escapeHtml(s.region)}</span>`
+              : `<span>${s.latitude.toFixed(3)}, ${s.longitude.toFixed(3)}</span>`;
+            li.innerHTML = `
+              <div class="sg-name">${escapeHtml(s.name || '(unnamed)')}</div>
+              <div class="sg-meta">${region}<a href="${ref.url}" target="_blank" rel="noopener noreferrer"
+                onmousedown="event.stopPropagation()">${ref.type} ${s.osmId} ↗</a></div>`;
+            // mousedown fires before blur, so this commits the pick even when
+            // the user clicks straight from a focused input.
+            li.addEventListener('mousedown', (e) => {
+              if (e.target.tagName === 'A') return; // let the link click through
+              e.preventDefault();
+              pick(s);
+            });
+            li.addEventListener('mouseenter', () => setActive(i));
+            list.appendChild(li);
+          });
+        }
+        list.hidden = false;
+        input.setAttribute('aria-expanded', 'true');
+      }
+      function showInfo(html) {
+        list.innerHTML = `<li class="sg-info">${html}</li>`;
+        list.hidden = false;
+        input.setAttribute('aria-expanded', 'true');
+      }
+      function pick(s) {
+        input.value = s.name || '';
+        railPick[side] = s;
+        combo.classList.add('picked');
+        railStationPin(side, s);
+        fitToPicks();
+        $('[data-action="rail-route"]').disabled = !(railPick.from && railPick.to);
+        close();
+      }
+      async function search(q) {
+        if (cache.has(q)) return cache.get(q);
+        const resp = await fetch(`/api/rail/stations?name=${encodeURIComponent(q)}`);
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        const stations = data.stations || [];
+        // Only memoize hits — caching an empty result for the session would
+        // freeze the typeahead on 'No matches' for a query that may have
+        // been transient (Photon slow path, partially-typed prefix).
+        if (stations.length > 0) cache.set(q, stations);
+        return stations;
+      }
+      const doSearch = debounce(async (q) => {
+        const my = ++reqId;
+        try {
+          const stations = await search(q);
+          if (my !== reqId) return;
+          render(stations);
+        } catch (e) {
+          if (my !== reqId) return;
+          showInfo(escapeHtml(e.message));
+        }
+      }, 220);
+
+      input.addEventListener('input', () => {
+        if (railPick[side]) clearPin(side);
+        railPick[side] = null;
+        combo.classList.remove('picked');
+        $('[data-action="rail-route"]').disabled = true;
+        const q = input.value.trim();
+        if (q.length < 2) {
+          close();
+          return;
+        }
+        // Cancel any pending debounced search AND bump reqId so a stale
+        // longer-query response that's still in flight can't overwrite
+        // either the cache-hit render below or the upcoming search.
+        doSearch.cancel();
+        reqId++;
+        if (cache.has(q)) {
+          render(cache.get(q));
+          return;
+        }
+        showInfo('<span class="spinner"></span> Searching…');
+        doSearch(q);
+      });
+      input.addEventListener('focus', () => {
+        const q = input.value.trim();
+        if (railPick[side]) return; // already picked, don't reopen
+        if (q.length >= 2 && cache.has(q)) render(cache.get(q));
+      });
+      input.addEventListener('blur', () => {
+        // Delay so a mousedown on the list still fires pick() first.
+        setTimeout(close, 150);
+      });
+      input.addEventListener('keydown', (e) => {
+        if (list.hidden && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+          const q = input.value.trim();
+          if (q.length >= 2 && cache.has(q)) render(cache.get(q));
+          return;
+        }
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          setActive(Math.min(activeIdx + 1, currentResults.length - 1));
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          setActive(Math.max(activeIdx - 1, 0));
+        } else if (e.key === 'Enter') {
+          if (activeIdx >= 0 && currentResults[activeIdx]) {
+            e.preventDefault();
+            pick(currentResults[activeIdx]);
+          }
+        } else if (e.key === 'Escape') {
+          close();
+        }
+      });
+    }
+
+    function renderRail(res) {
+      rail.kml = res.kml;
+      rail.filename = res.filename;
+      $('#rail-callsign').textContent = res.callsign;
+      $('#rail-meta').textContent =
+        `${res.origin.name} → ${res.destination.name} · ${res.track.length} points · ${res.distanceKm.toFixed(1)} km`;
+      $('#rail-download-btn').textContent = `Download ${res.filename}`;
+      $('#rail-result-head').hidden = false;
+      ensureRailMap();
+      setTimeout(() => rail.map.invalidateSize(), 0);
+      rail.trackLayer.clearLayers();
+      railPinLayer.from = railPinLayer.to = null;
+
+      // Rail tracks never cross the antimeridian — no longitude unwrap needed.
+      const pts = res.track.map(p => [p.latitude, p.longitude]);
+      const line = L.polyline(pts, { color: '#2f2a26', weight: 3, opacity: 0.9 }).addTo(rail.trackLayer);
+      railStationPin('from', res.origin);
+      railStationPin('to', res.destination);
+      line.bindPopup(`${escapeHtml(res.callsign)}: ${res.track.length} points · ${res.distanceKm.toFixed(1)} km`);
+      rail.map.fitBounds(line.getBounds(), { padding: [40, 40] });
+    }
+
+    async function railRoute() {
+      clearRailError();
+      if (!railPick.from || !railPick.to) {
+        showRailError('Pick both stations first.');
+        return;
+      }
+      // Reject identical From/To early — Dijkstra would otherwise return
+      // an empty track that crashes Leaflet's fitBounds on empty bounds.
+      // Comparing OSM identity falls back to coords if Photon didn't give
+      // us an id (legacy round-trip).
+      const samePick = (a, b) =>
+        (a.osmId && b.osmId && a.osmType === b.osmType && a.osmId === b.osmId) ||
+        (a.latitude === b.latitude && a.longitude === b.longitude);
+      if (samePick(railPick.from, railPick.to)) {
+        showRailError('From and To are the same station — pick two different stations to route between.');
+        return;
+      }
+      const btn = document.querySelector('[data-action="rail-route"]');
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = 'Routing…';
+      try {
+        const params = new URLSearchParams({
+          fromLat: railPick.from.latitude, fromLon: railPick.from.longitude, fromName: railPick.from.name,
+          fromOsmId: railPick.from.osmId ?? '', fromOsmType: railPick.from.osmType ?? '',
+          toLat: railPick.to.latitude, toLon: railPick.to.longitude, toName: railPick.to.name,
+          toOsmId: railPick.to.osmId ?? '', toOsmType: railPick.to.osmType ?? '',
+        });
+        const resp = await fetch(`/api/rail?${params.toString()}`);
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        renderRail(data);
+      } catch (e) {
+        showRailError(e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+
+    setupStationCombobox('from');
+    setupStationCombobox('to');
+    document.querySelector('[data-action="rail-route"]').addEventListener('click', railRoute);
+  </script>
+</body>
+</html>

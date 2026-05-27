@@ -1,0 +1,12 @@
+# Go build / hot-reload
+tmp/
+*.exe
+
+# Playwright MCP session artifacts
+.playwright-mcp/
+
+# Local sample data and dev iteration outputs
+*.png
+*.kml
+*-playback.json
+!docs/*.png
