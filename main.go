@@ -23,6 +23,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -49,7 +50,13 @@ func normalizeFlight(s string) string {
 var staticFS embed.FS
 
 func main() {
-	addr := flag.String("addr", ":8080", "listen address")
+	// Vercel's Go runtime injects PORT and expects the server to listen on it.
+	// Locally PORT is unset, so we keep the :8080 default; -addr still overrides.
+	defaultAddr := ":8080"
+	if port := os.Getenv("PORT"); port != "" {
+		defaultAddr = ":" + port
+	}
+	addr := flag.String("addr", defaultAddr, "listen address")
 	flag.Parse()
 
 	client, err := fr24.New()
