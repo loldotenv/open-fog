@@ -99,11 +99,10 @@
     .picker .meta {
       font-size: 14px; line-height: 1.5; color: var(--body); margin-top: 4px;
     }
-    .picker .meta a, .fr24-link {
+    .picker .meta a {
       color: var(--ink); text-decoration: underline; text-underline-offset: 2px;
     }
-    .picker .meta a:hover, .fr24-link:hover { color: var(--primary); }
-    .fr24-link { font-size: 14px; margin-left: 4px; }
+    .picker .meta a:hover { color: var(--primary); }
     button.primary {
       align-self: flex-start;
       padding: 12px 22px;
@@ -136,6 +135,7 @@
       letter-spacing: -0.02em; color: var(--ink);
     }
     .map { height: 480px; border-radius: 12px; overflow: hidden; }
+    .result-actions { display: flex; justify-content: flex-end; margin-top: 16px; }
     code {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       background: var(--canvas-soft); padding: 2px 6px; border-radius: 4px;
@@ -230,7 +230,7 @@
     <header>
       <h1>open-fog</h1>
       <p class="lead">Backfill your <em>Fog of World</em> map.</p>
-      <p class="muted">Pull a flight or rail track, export it as a Fog of World-compatible KML.</p>
+      <p class="muted">Pull a flight or rail track and export it as a Fog of World–compatible KML.</p>
     </header>
 
     <div>
@@ -247,7 +247,7 @@
             <input id="date-input" type="date" />
           </div>
           <button class="primary" type="submit" data-action="lookup" disabled style="margin-top:16px">Look up &amp; convert</button>
-          <p class="hint" style="margin-top:8px">Scrapes the FR24 history page (free tier: last ~7 days). UTC date — for late-night east-Asia departures, pick the day FR24 sees, not your local one.</p>
+          <p class="hint" style="margin-top:8px">Reads the Flightradar24 history page — free tier, last ~7 days. Enter the UTC date: for late-night East Asia departures, pick the day FR24 sees, not your local one.</p>
         </form>
         <div id="error" class="error" hidden></div>
         <div id="picker" hidden>
@@ -277,7 +277,7 @@
             </div>
           </div>
           <button class="primary" type="button" data-action="rail-route" disabled style="margin-top:16px">Route &amp; convert</button>
-          <p class="hint" style="margin-top:8px">Station suggestions via <a href="https://photon.komoot.io/" target="_blank" rel="noopener">Photon</a> (OSM). Pick one for each, then route — the <em>Railway lines</em> overlay is on by default so you can sanity-check coverage.</p>
+          <p class="hint" style="margin-top:8px">Station suggestions via <a href="https://photon.komoot.io/" target="_blank" rel="noopener">Photon</a> (OSM). Pick one for each, then route — the <em>Railway lines</em> overlay is on by default so you can check coverage.</p>
         </form>
         <div id="rail-error" class="error" hidden></div>
       </section>
@@ -288,11 +288,12 @@
         <div>
           <div class="callsign" id="flight-callsign"></div>
           <div class="muted" id="flight-meta"></div>
-          <div class="muted small" id="flight-fr24"></div>
         </div>
-        <button class="primary" id="flight-download-btn">Download KML</button>
       </header>
       <div id="flight-map" class="map"></div>
+      <div class="result-actions" id="flight-actions" hidden>
+        <button class="primary" id="flight-download-btn">Download KML</button>
+      </div>
     </section>
 
     <section class="panel" id="rail-map-panel" hidden>
@@ -301,9 +302,11 @@
           <div class="callsign" id="rail-callsign"></div>
           <div class="muted" id="rail-meta"></div>
         </div>
-        <button class="primary" id="rail-download-btn">Download KML</button>
       </header>
       <div id="rail-map" class="map"></div>
+      <div class="result-actions" id="rail-actions" hidden>
+        <button class="primary" id="rail-download-btn">Download KML</button>
+      </div>
     </section>
 
     <footer class="muted">
@@ -349,6 +352,7 @@
       errBox.textContent = msg;
       errBox.hidden = false;
       $('#flight-result-head').hidden = true;
+      $('#flight-actions').hidden = true;
     }
     function clearError() { errBox.hidden = true; errBox.textContent = ''; }
 
@@ -381,28 +385,22 @@
       rail.trackLayer = L.layerGroup().addTo(rail.map);
     }
 
-    function renderResult(res, candidate) {
+    function renderResult(res) {
       // Guard before mutating any rendering state — kml.Convert can return
       // legs with empty airborne (pre-departure, taxi-only playbacks). Raw
       // raw[0] dereference below would otherwise crash and leave the UI
-      // stuck on 'Working…' with stale flight.kml/filename armed.
+      // stuck on 'Looking up…' with stale flight.kml/filename armed.
       if (!res.airborne || res.airborne.length === 0) {
-        throw new Error('No airborne playback samples for this leg — FR24 has nothing to render.');
+        throw new Error('No airborne track for this leg yet — FR24 has nothing to plot.');
       }
       flight.kml = res.kml;
       flight.filename = res.filename;
       const code = (a) => a.iata || a.icao;
       $('#flight-callsign').textContent = res.callsign;
       $('#flight-meta').textContent = `${code(res.origin)} → ${code(res.destination)} · ${res.airborne.length} airborne points`;
-      const fr24 = $('#flight-fr24');
-      if (candidate) {
-        const url = fr24Url(currentFlightNumber, candidate.flightId);
-        fr24.innerHTML = `<a class="fr24-link" href="${url}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">open on flightradar24 ↗</a>`;
-      } else {
-        fr24.innerHTML = '';
-      }
       $('#flight-download-btn').textContent = `Download ${res.filename}`;
       $('#flight-result-head').hidden = false;
+      $('#flight-actions').hidden = false;
       ensureFlightMap();
       // Force Leaflet to recompute the now-visible map size.
       setTimeout(() => flight.map.invalidateSize(), 0);
@@ -458,7 +456,7 @@
       const data = await resp.json();
       if (reqId !== activeTrackRequest) return;
       if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-      renderResult(data, c);
+      renderResult(data);
     }
 
     function showPicker(candidates) {
@@ -479,7 +477,7 @@
         b.innerHTML = `
           <div class="route">${route}${cities}</div>
           <div class="meta">
-            STD ${escapeHtml(localHHMM(c.timestamp, c.offsetSec))} local · flightId ${escapeHtml(String(c.flightId))}
+            STD ${escapeHtml(localHHMM(c.timestamp, c.offsetSec))} local · ID ${escapeHtml(String(c.flightId))}
             ${c.hasATD ? '' : ' · <em>not yet departed — no playback</em>'}
           </div>`;
         b.disabled = !c.hasATD;
@@ -496,7 +494,7 @@
         const linkRow = document.createElement('div');
         linkRow.className = 'meta';
         linkRow.style.padding = '0 0.85rem 0.4rem';
-        linkRow.innerHTML = `<a href="${encodeURI(url)}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">open on flightradar24 ↗</a>`;
+        linkRow.innerHTML = `<a href="${encodeURI(url)}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">Open on Flightradar24 ↗</a>`;
         li.appendChild(linkRow);
         list.appendChild(li);
       }
@@ -508,22 +506,23 @@
       clearError();
       $('#picker').hidden = true;
       $('#flight-result-head').hidden = true;
+      $('#flight-actions').hidden = true;
       const btn = document.querySelector('[data-action="lookup"]');
       isLookupLoading = true;
       btn.disabled = true;
       const original = btn.textContent;
-      btn.textContent = 'Working…';
+      btn.textContent = 'Looking up…';
       try {
         const num = $('#flight-input').value.trim();
         const date = $('#date-input').value;
-        if (!num || !date) throw new Error('Both flight number and date are required');
+        if (!num || !date) throw new Error('Enter both a flight number and a date.');
         currentFlightNumber = num;
         const resp = await fetch(`/api/candidates?flight=${encodeURIComponent(num)}&date=${date}`);
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
         const cs = data.candidates || [];
         if (cs.length === 0) {
-          throw new Error('No legs found.');
+          throw new Error('No legs found for that flight and date.');
         }
         // Always render the picker so the user can switch legs and see the
         // FR24 URL — even for single-leg results.
@@ -600,6 +599,7 @@
       railErr.textContent = msg;
       railErr.hidden = false;
       $('#rail-result-head').hidden = true;
+      $('#rail-actions').hidden = true;
     }
     function clearRailError() { railErr.hidden = true; railErr.textContent = ''; }
 
@@ -836,6 +836,7 @@
         `${res.origin.name} → ${res.destination.name} · ${res.track.length} points · ${res.distanceKm.toFixed(1)} km`;
       $('#rail-download-btn').textContent = `Download ${res.filename}`;
       $('#rail-result-head').hidden = false;
+      $('#rail-actions').hidden = false;
       ensureRailMap();
       setTimeout(() => rail.map.invalidateSize(), 0);
       rail.trackLayer.clearLayers();
@@ -864,7 +865,7 @@
         (a.osmId && b.osmId && a.osmType === b.osmType && a.osmId === b.osmId) ||
         (a.latitude === b.latitude && a.longitude === b.longitude);
       if (samePick(railPick.from, railPick.to)) {
-        showRailError('From and To are the same station — pick two different stations to route between.');
+        showRailError('From and To are the same station — pick two different ones.');
         return;
       }
       const btn = document.querySelector('[data-action="rail-route"]');
