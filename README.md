@@ -8,8 +8,8 @@ uncover the tiles.
 
 ## What it does
 
-- **Flights** — type a flight number + UTC date, scrape the FR24 history page
-  (free tier, last ~7 days), convert the playback to KML.
+- **Flights** — type a flight number + date (origin-local), scrape the FR24
+  history page (free tier, last ~7 days), convert the playback to KML.
 - **Trains** — search two stations (OSM via [Photon](https://photon.komoot.io/)),
   pick the pins, route along the actual rail right-of-way, export the polyline
   as KML.
