@@ -32,6 +32,25 @@ var overpassMirrors = []string{
 	"https://overpass.private.coffee/api/interpreter",
 }
 
+// Overpass fetch budget. Public mirrors are slow and frequently hang, and the
+// whole rail request runs inside a serverless function capped at 300 s (the
+// Vercel Hobby ceiling, fluid compute enabled). The sum of all mirror attempts
+// plus graph building must finish under that — otherwise the platform hard-
+// kills the function with an opaque 504 before the mirror fallback or our own
+// error messages ever run. Tries are sequential, so without a per-try cap a
+// single hung mirror eats the entire budget.
+const (
+	// overpassPerTry caps one mirror attempt. Legitimate rail-network queries
+	// take 30–90 s; 75 s covers the common case and bails on a hung mirror
+	// fast enough to fall through to the next one within budget.
+	overpassPerTry = 75 * time.Second
+
+	// overpassBudget caps total wall-clock across all mirror attempts. With 3
+	// mirrors × 75 s = 225 s this leaves ~75 s of the 300 s function ceiling
+	// for JSON decode, graph build, Dijkstra, densify, and the response.
+	overpassBudget = 230 * time.Second
+)
+
 // Tunables. Constants rather than knobs because the web form deliberately
 // keeps things minimal — if these prove wrong we can iterate.
 const (
@@ -96,13 +115,23 @@ type Result struct {
 type Client struct {
 	HTTP    *http.Client
 	Mirrors []string
+
+	// perTry / budget bound the Overpass fetch (defaults: overpassPerTry /
+	// overpassBudget). Fields rather than direct const use so tests can drive
+	// the fallback and budget logic without real-time waits; zero means default.
+	perTry time.Duration
+	budget time.Duration
 }
 
 func New() *Client {
 	return &Client{
-		// Overpass queries on rail networks can take 30–90 s.
-		HTTP:    &http.Client{Timeout: 180 * time.Second},
+		// Per-request context deadlines govern each call (overpassPerTry for
+		// routing, photonTimeout for station lookup); this client-level timeout
+		// is only an absolute backstop, kept under the 300 s function ceiling.
+		HTTP:    &http.Client{Timeout: overpassBudget},
 		Mirrors: overpassMirrors,
+		// perTry/budget left zero — query() falls back to the consts. Tests set
+		// them to drive the budget logic without real-time waits.
 	}
 }
 
@@ -126,17 +155,46 @@ type overpassGeomPt struct {
 }
 
 func (c *Client) query(ctx context.Context, q string) (*overpassResp, error) {
+	perTry, budget := c.perTry, c.budget
+	if perTry == 0 {
+		perTry = overpassPerTry
+	}
+	if budget == 0 {
+		budget = overpassBudget
+	}
+	deadline := time.Now().Add(budget)
 	var lastErr error
 	for _, endpoint := range c.Mirrors {
-		v, err := c.queryOne(ctx, endpoint, q)
+		// Stop before starting another attempt if the caller cancelled (e.g.
+		// the function deadline fired) — a clean ctx error beats running into
+		// the platform's hard 300 s kill.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break // total budget spent; don't start a doomed attempt.
+		}
+		try := perTry
+		if remaining < try {
+			try = remaining
+		}
+		// Per-mirror deadline: a hung mirror is abandoned at `try` and we fall
+		// through to the next one. This is a per-try timeout, not a caller
+		// cancellation, so its error must NOT abort the loop.
+		tctx, cancel := context.WithTimeout(ctx, try)
+		v, err := c.queryOne(tctx, endpoint, q)
+		cancel()
 		if err == nil {
 			return v, nil
 		}
 		lastErr = err
-		// Don't retry on caller-cancellation — that's an intentional abort.
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if lastErr == nil {
+		lastErr = errors.New("overpass: no mirror attempted within budget")
 	}
 	return nil, lastErr
 }
@@ -352,9 +410,12 @@ func (c *Client) FetchRailNetwork(ctx context.Context, a, b Station) (*overpassR
 	west := math.Min(a.Longitude, b.Longitude) - bboxPadDeg
 	north := math.Max(a.Latitude, b.Latitude) + bboxPadDeg
 	east := math.Max(a.Longitude, b.Longitude) + bboxPadDeg
-	q := fmt.Sprintf(`[out:json][timeout:180][bbox:%f,%f,%f,%f];
+	// Overpass [timeout:] is the server-side execution cap; match it to the
+	// per-mirror client deadline so the mirror gives up around the same time we
+	// do instead of grinding on a query we've already abandoned.
+	q := fmt.Sprintf(`[out:json][timeout:%d][bbox:%f,%f,%f,%f];
 way["railway"~"^(rail|narrow_gauge)$"][!"service"];
-out geom;`, south, west, north, east)
+out geom;`, int(overpassPerTry/time.Second), south, west, north, east)
 	return c.query(ctx, q)
 }
 
