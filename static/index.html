@@ -4,12 +4,13 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>open-fog · backfill your Fog of World map</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-        crossorigin="" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&display=swap" />
+  <!-- Leaflet (CSS + ~140KB JS) loads lazily on first map use — the landing
+       view is just a form, so the map library stays off the critical path.
+       Warm the unpkg connection now so that deferred fetch is fast. -->
+  <link rel="preconnect" href="https://unpkg.com" crossorigin />
   <style>
     :root {
       --canvas: #fffefb;
@@ -177,26 +178,27 @@
     }
     .tabs {
       display: flex; gap: 4px;
-      border-bottom: 1px solid var(--mute);
+      /* Overlap the panel by 1px so the active tab's fill meets it with no seam. */
       margin-bottom: -1px;
     }
     .tab {
       padding: 10px 20px;
-      background: transparent;
-      border: 1px solid transparent; border-bottom: none;
+      background: transparent; border: none;
       border-top-left-radius: 10px; border-top-right-radius: 10px;
       cursor: pointer;
       font: 500 14px/1.2 var(--font-sans);
       letter-spacing: -0.005em;
       color: var(--body-mid);
-      transition: color 0.1s ease;
+      transition: color 0.1s ease, background-color 0.1s ease;
     }
-    .tab:hover { color: var(--ink); }
+    /* Inactive tabs read as plain labels; a faint fill on hover signals they're
+       clickable without competing with the active tab's solid fill. */
+    .tab:hover { color: var(--ink); background: rgba(32, 21, 21, 0.04); }
     .tab[aria-selected="true"] {
       background: var(--canvas-soft);
-      border-color: var(--mute);
       color: var(--ink);
     }
+    .tab[aria-selected="true"]:hover { background: var(--canvas-soft); }
     .tab-panel { display: none; }
     .tab-panel.active { display: block; }
     .panel.tabbed { border-top-left-radius: 0; border-top-right-radius: 0; }
@@ -317,7 +319,7 @@
           </div>
           <label class="opt-toggle">
             <input type="checkbox" id="rail-highspeed" checked />
-            Prefer high-speed line (Shinkansen / TGV / ICE) where available
+            Prefer high-speed line where available
           </label>
           <button class="primary" type="button" data-action="rail-route" disabled style="margin-top:16px">Route &amp; convert</button>
           <p class="hint" style="margin-top:8px">Station suggestions via <a href="https://photon.komoot.io/" target="_blank" rel="noopener">Photon</a> (OSM). Pick one for each, then route — the <em>Railway lines</em> overlay is on by default so you can check coverage.</p>
@@ -356,13 +358,39 @@
     </footer>
   </div>
 
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-          crossorigin=""></script>
   <script>
     const $ = (sel) => document.querySelector(sel);
     const $$ = (sel) => document.querySelectorAll(sel);
     const errBox = $('#error');
+
+    // Lazy-load Leaflet (CSS + JS) on the first map use. The landing view is a
+    // form, so deferring the library shaves a render-blocking stylesheet and a
+    // ~140KB script off initial load. The promise is cached, so the second
+    // tab's map reuses the single in-flight/settled load; on failure we reset
+    // it to null so a later attempt (re-route, re-pick) can retry.
+    let leafletReady = null;
+    function loadLeaflet() {
+      if (leafletReady) return leafletReady;
+      leafletReady = new Promise((resolve, reject) => {
+        const css = document.createElement('link');
+        css.rel = 'stylesheet';
+        css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+        css.integrity = 'sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=';
+        css.crossOrigin = '';
+        document.head.appendChild(css);
+        const js = document.createElement('script');
+        js.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+        js.integrity = 'sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=';
+        js.crossOrigin = '';
+        js.onload = () => resolve();
+        js.onerror = () => {
+          leafletReady = null;
+          reject(new Error('Could not load the map library — check your connection and retry.'));
+        };
+        document.head.appendChild(js);
+      });
+      return leafletReady;
+    }
     let currentFlightNumber = '';
     // Monotonic id of the most recently dispatched /api/track request. Used to
     // discard stale responses when the user clicks multiple legs rapidly.
@@ -399,9 +427,12 @@
     }
     function clearError() { errBox.hidden = true; errBox.textContent = ''; }
 
-    function ensureFlightMap() {
+    async function ensureFlightMap() {
       flight.hasData = true;
       syncMapPanelVisibility();
+      if (flight.map) return;
+      await loadLeaflet();
+      // A second leg click may have built the map while Leaflet was loading.
       if (flight.map) return;
       flight.map = L.map('flight-map', { worldCopyJump: true, preferCanvas: true }).setView([20, 0], 2);
       L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -411,9 +442,12 @@
       flight.trackLayer = L.layerGroup().addTo(flight.map);
     }
 
-    function ensureRailMap() {
+    async function ensureRailMap() {
       rail.hasData = true;
       syncMapPanelVisibility();
+      if (rail.map) return;
+      await loadLeaflet();
+      // A concurrent pick/route may have built the map while Leaflet loaded.
       if (rail.map) return;
       rail.map = L.map('rail-map', { worldCopyJump: true, preferCanvas: true }).setView([20, 0], 2);
       const osmBase = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -428,7 +462,7 @@
       rail.trackLayer = L.layerGroup().addTo(rail.map);
     }
 
-    function renderResult(res) {
+    async function renderResult(res) {
       // Guard before mutating any rendering state — kml.Convert can return
       // legs with empty airborne (pre-departure, taxi-only playbacks). Raw
       // raw[0] dereference below would otherwise crash and leave the UI
@@ -444,7 +478,7 @@
       $('#flight-download-btn').textContent = `Download ${res.filename}`;
       $('#flight-result-head').hidden = false;
       $('#flight-actions').hidden = false;
-      ensureFlightMap();
+      await ensureFlightMap();
       // Force Leaflet to recompute the now-visible map size.
       setTimeout(() => flight.map.invalidateSize(), 0);
       flight.trackLayer.clearLayers();
@@ -499,7 +533,14 @@
       const data = await resp.json();
       if (reqId !== activeTrackRequest) return;
       if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-      renderResult(data);
+      // Load Leaflet before the final staleness check so the render runs to
+      // completion without yielding to the event loop. Otherwise the lazy
+      // first-load await inside renderResult could let a newer leg click slip
+      // in, and the older render would still finish — leaving the map showing a
+      // different leg than the header.
+      await loadLeaflet();
+      if (reqId !== activeTrackRequest) return;
+      await renderResult(data);
     }
 
     function showPicker(candidates) {
@@ -675,7 +716,8 @@
     }
 
     function railStationPin(side, station) {
-      ensureRailMap();
+      // Callers (pick, renderRail) await ensureRailMap() first, so the map, its
+      // trackLayer, and the Leaflet global are all ready by the time we get here.
       if (railPinLayer[side]) rail.trackLayer.removeLayer(railPinLayer[side]);
       // Letter + color together so the From/To distinction survives both
       // colorblind viewers and grayscale screenshots.
@@ -790,14 +832,25 @@
         list.hidden = false;
         input.setAttribute('aria-expanded', 'true');
       }
-      function pick(s) {
+      async function pick(s) {
         input.value = s.name || '';
         railPick[side] = s;
         combo.classList.add('picked');
-        railStationPin(side, s);
-        fitToPicks();
         $('[data-action="rail-route"]').disabled = !(railPick.from && railPick.to);
         close();
+        // Form updates above stay synchronous so picking always feels instant.
+        // Drop the pin once Leaflet + the map are ready — on the first pick this
+        // triggers the lazy map load; later picks resolve immediately.
+        try {
+          await ensureRailMap();
+          // The user may have re-edited or cleared this field while Leaflet
+          // loaded; only drop the pin if this pick is still the current one.
+          if (railPick[side] !== s) return;
+          railStationPin(side, s);
+          fitToPicks();
+        } catch (e) {
+          showRailError(e.message);
+        }
       }
       async function search(q) {
         if (cache.has(q)) return cache.get(q);
@@ -880,7 +933,7 @@
       });
     }
 
-    function renderRail(res) {
+    async function renderRail(res) {
       rail.kml = res.kml;
       rail.filename = res.filename;
       $('#rail-callsign').textContent = res.callsign;
@@ -889,7 +942,7 @@
       $('#rail-download-btn').textContent = `Download ${res.filename}`;
       $('#rail-result-head').hidden = false;
       $('#rail-actions').hidden = false;
-      ensureRailMap();
+      await ensureRailMap();
       setTimeout(() => rail.map.invalidateSize(), 0);
       rail.trackLayer.clearLayers();
       railPinLayer.from = railPinLayer.to = null;
@@ -940,7 +993,7 @@
         const resp = await fetch(`/api/rail?${params.toString()}`);
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-        renderRail(data);
+        await renderRail(data);
       } catch (e) {
         showRailError(e.message);
       } finally {
