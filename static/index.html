@@ -571,9 +571,15 @@
       const date = $('#date-input').value;
       document.querySelector('[data-action="lookup"]').disabled = !(num && date);
     }
-    $('#flight-input').addEventListener('input', syncLookupButton);
-    $('#date-input').addEventListener('input', syncLookupButton);
-    $('#date-input').addEventListener('change', syncLookupButton);
+    // Editing the flight number or date invalidates the last rendered leg —
+    // pull its download until a fresh lookup re-renders one.
+    function onFlightSearchEdited() {
+      $('#flight-actions').hidden = true;
+      syncLookupButton();
+    }
+    $('#flight-input').addEventListener('input', onFlightSearchEdited);
+    $('#date-input').addEventListener('input', onFlightSearchEdited);
+    $('#date-input').addEventListener('change', onFlightSearchEdited);
     syncLookupButton();
 
     function downloadKml(state) {
@@ -794,6 +800,9 @@
         railPick[side] = null;
         combo.classList.remove('picked');
         $('[data-action="rail-route"]').disabled = true;
+        // Editing a station invalidates the last routed result — pull its
+        // download so a stale KML can't be saved before the new route runs.
+        $('#rail-actions').hidden = true;
         const q = input.value.trim();
         if (q.length < 2) {
           close();
