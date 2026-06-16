@@ -6,8 +6,10 @@
 //   GET  /api/track?flightId=<hex>&timestamp=<unix>     fetch + convert one
 //   GET  /api/rail/stations?name=<name>                 OSM station candidates
 //   GET  /api/rail?fromLat=&fromLon=&toLat=&toLon=&fromName=&toName=
-//                  [&date=<YYYY-MM-DD>]                  OSM-routed rail track
-//                  (date defaults to today UTC; appears in filename + docName)
+//                  [&date=<YYYY-MM-DD>][&highspeed=false] OSM-routed rail track
+//                  (date defaults to today UTC; appears in filename + docName.
+//                   highspeed defaults to true — prefer Shinkansen/high-speed
+//                   lines; pass false to route the conventional network)
 //
 // The two-step shape lets the frontend disambiguate when a flight number flies
 // multiple legs the same day (tag flights, disruption renumbering).
@@ -181,7 +183,12 @@ func railHandler(client *rail.Client) http.HandlerFunc {
 		// must be present and monotonically increasing in the gx:Track.
 		start = time.Date(start.Year(), start.Month(), start.Day(), 9, 0, 0, 0, time.UTC)
 
-		res, err := client.GenerateFromCoords(r.Context(), src, dst, start)
+		// Prefer high-speed lines (Shinkansen, TGV, …) by default so an inter-city
+		// route follows the high-speed alignment instead of the parallel
+		// conventional line. The frontend toggle sends highspeed=false to opt out.
+		preferHS := q.Get("highspeed") != "false"
+
+		res, err := client.GenerateFromCoords(r.Context(), src, dst, start, preferHS)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return

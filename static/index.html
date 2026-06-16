@@ -85,6 +85,25 @@
     input:focus { outline: 2px solid var(--primary); outline-offset: -1px; border-color: var(--primary); }
     .row { display: flex; gap: 12px; flex-wrap: wrap; }
     .row > * { flex: 1 1 0; min-width: 10rem; }
+    .opt-toggle {
+      display: flex; align-items: center; gap: 10px; margin-top: 16px;
+      font-size: 14px; font-weight: 400; text-transform: none;
+      letter-spacing: normal; color: var(--body); cursor: pointer;
+    }
+    .opt-toggle input {
+      appearance: none; -webkit-appearance: none;
+      flex: none; width: 38px; height: 22px; margin: 0; padding: 0;
+      border: none; border-radius: 999px; background: #d6d0c8;
+      position: relative; cursor: pointer; transition: background-color 0.18s ease;
+    }
+    .opt-toggle input::before {
+      content: ""; position: absolute; top: 2px; left: 2px;
+      width: 18px; height: 18px; border-radius: 50%; background: #fff;
+      box-shadow: 0 1px 2px rgba(32, 21, 21, 0.25); transition: transform 0.18s ease;
+    }
+    .opt-toggle input:checked { background: var(--primary); }
+    .opt-toggle input:checked::before { transform: translateX(16px); }
+    .opt-toggle input:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
     .picker {
       list-style: none; padding: 0; margin: 8px 0 0;
       display: flex; flex-direction: column; gap: 8px;
@@ -146,6 +165,11 @@
     }
     .map { height: 480px; border-radius: 12px; overflow: hidden; }
     .result-actions { display: flex; justify-content: flex-end; margin-top: 16px; }
+    /* The `display: flex` above (author rule) overrides the UA [hidden] rule, so
+       the hidden attribute alone won't hide these. Restore it explicitly — the
+       attribute selector outranks the plain class — so toggling .hidden actually
+       pulls the result header and download button when no track is ready. */
+    .result-head[hidden], .result-actions[hidden] { display: none; }
     code {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       background: var(--canvas-soft); padding: 2px 6px; border-radius: 4px;
@@ -291,6 +315,10 @@
               </div>
             </div>
           </div>
+          <label class="opt-toggle">
+            <input type="checkbox" id="rail-highspeed" checked />
+            Prefer high-speed line (Shinkansen / TGV / ICE) where available
+          </label>
           <button class="primary" type="button" data-action="rail-route" disabled style="margin-top:16px">Route &amp; convert</button>
           <p class="hint" style="margin-top:8px">Station suggestions via <a href="https://photon.komoot.io/" target="_blank" rel="noopener">Photon</a> (OSM). Pick one for each, then route — the <em>Railway lines</em> overlay is on by default so you can check coverage.</p>
         </form>
@@ -896,12 +924,18 @@
       btn.disabled = true;
       const original = btn.textContent;
       btn.textContent = 'Routing…';
+      // Pull the previous route's header + download while the new one computes
+      // (rail routing can take minutes) so a stale KML can't be saved as if it
+      // were the result the form now describes. Mirrors the flight lookup flow.
+      $('#rail-result-head').hidden = true;
+      $('#rail-actions').hidden = true;
       try {
         const params = new URLSearchParams({
           fromLat: railPick.from.latitude, fromLon: railPick.from.longitude, fromName: railPick.from.name,
           fromOsmId: railPick.from.osmId ?? '', fromOsmType: railPick.from.osmType ?? '',
           toLat: railPick.to.latitude, toLon: railPick.to.longitude, toName: railPick.to.name,
           toOsmId: railPick.to.osmId ?? '', toOsmType: railPick.to.osmType ?? '',
+          highspeed: $('#rail-highspeed').checked,
         });
         const resp = await fetch(`/api/rail?${params.toString()}`);
         const data = await resp.json();

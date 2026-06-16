@@ -88,8 +88,61 @@ const (
 	// between two distant endpoints (gaps up to ~10 km observed on HSR
 	// lines), which leaves Fog of World tiles (~1.1 km each) uncovered.
 	// 200 m guarantees at least one point inside every tile along the route.
+	// It is also the resample spacing for smooth() — note that smoothing fills
+	// such a tunnel chord with points but cannot bend it back onto the real
+	// curve, because OSM has no intermediate geometry there to curve toward.
 	densifyTargetM = 200.0
+
+	// catmullAlpha is the Catmull-Rom parameterisation used by smooth(). 0.5 is
+	// the centripetal case — the only value mathematically proven free of cusps
+	// and self-intersections, so corner-rounding never loops back on the track.
+	catmullAlpha = 0.5
 )
+
+// Turn-cost tunables. A train cannot pivot at a node the way a shortest-path
+// search over an undirected graph otherwise would: a switch diverges gently and
+// a crossing is traversed straight through, but a ~90° turn onto a crossing line
+// or a ~180° reversal at a junction is physically impossible. Routing over
+// directed edges (state = "arrived at a node via a specific edge") lets us
+// measure the heading change at each node and forbid turns sharper than
+// maxTurnDeg — which removes the line-hops, crossing spikes, and bridge-edge
+// jogs that otherwise render as straight "jumps" on the map. This is the same
+// technique OSM rail routers (Geofabrik OpenRailRouting, the OSRM train profile)
+// use; we port it into our Dijkstra rather than adopt a heavyweight engine.
+const (
+	// maxTurnDeg forbids any transition whose heading change exceeds it. 60°
+	// clears real mapped curves (a few degrees per node) and gentle switch
+	// divergence, while rejecting ~90° crossings and ~180° reversals.
+	maxTurnDeg = 60.0
+
+	// turnPenaltyM is a small per-degree tie-break added to edge cost so that,
+	// where two continuations are both legal, the straighter one wins — which
+	// suppresses residual hopping at shallow junctions.
+	turnPenaltyM = 2.0
+)
+
+// High-speed-line preference. When the user opts in (the default), routing
+// favours highspeed=yes ways (Shinkansen, TGV, ICE …) so an inter-city journey
+// follows the high-speed alignment instead of the geometrically shorter
+// conventional line that runs parallel to it. Two levers combine:
+//
+//   - highspeedDiscount scales the routing *cost* (not the reported distance) of
+//     a high-speed edge, so the search prefers it unless the conventional
+//     alternative is much shorter.
+//   - the start/end are snapped to the nearest high-speed node (when one is in
+//     range) rather than the nearest node overall — without this the cost
+//     discount is unreachable, because boarding a grade-separated high-speed
+//     line from a conventional platform requires a near-perpendicular connector
+//     that the turn-angle cap rejects.
+//
+// A station with no high-speed line nearby falls back to ordinary routing, so
+// short/rural journeys are unaffected.
+const highspeedDiscount = 0.5
+
+// maxSnapM caps how far a station may sit from the rail node it snaps to. Past
+// this the bbox almost certainly doesn't contain a line that actually serves
+// the station, so erroring beats routing from an unrelated track.
+const maxSnapM = 5000.0
 
 // Station is a geocoded OSM railway station.
 type Station struct {
@@ -503,9 +556,10 @@ func keyOf(lat, lon float64) nodeKey {
 }
 
 type edge struct {
-	to     nodeKey
-	weight float64
-	geom   []Point // segment geometry from `from` to `to` (inclusive)
+	to        nodeKey
+	weight    float64
+	geom      []Point // segment geometry from `from` to `to` (inclusive)
+	highspeed bool    // source way was tagged highspeed=yes (Shinkansen, TGV, …)
 }
 
 type graph map[nodeKey][]edge
@@ -536,6 +590,7 @@ func buildGraph(ways *overpassResp) graph {
 		if el.Type != "way" || len(el.Geometry) < 2 {
 			continue
 		}
+		hs := el.Tags["highspeed"] == "yes"
 		for i := 0; i < len(el.Geometry)-1; i++ {
 			a, b := el.Geometry[i], el.Geometry[i+1]
 			ka, kb := keyOf(a.Lat, a.Lon), keyOf(b.Lat, b.Lon)
@@ -544,11 +599,11 @@ func buildGraph(ways *overpassResp) graph {
 			}
 			d := haversine(a.Lat, a.Lon, b.Lat, b.Lon)
 			g[ka] = append(g[ka], edge{
-				to: kb, weight: d,
+				to: kb, weight: d, highspeed: hs,
 				geom: []Point{{Latitude: a.Lat, Longitude: a.Lon}, {Latitude: b.Lat, Longitude: b.Lon}},
 			})
 			g[kb] = append(g[kb], edge{
-				to: ka, weight: d,
+				to: ka, weight: d, highspeed: hs,
 				geom: []Point{{Latitude: b.Lat, Longitude: b.Lon}, {Latitude: a.Lat, Longitude: a.Lon}},
 			})
 		}
@@ -638,6 +693,54 @@ func (g graph) nearestNode(lat, lon float64) (nodeKey, float64) {
 	return best, bestD
 }
 
+// nodeIsHighspeed reports whether any way through n is a high-speed line.
+func (g graph) nodeIsHighspeed(n nodeKey) bool {
+	for _, e := range g[n] {
+		if e.highspeed {
+			return true
+		}
+	}
+	return false
+}
+
+// nearestHighspeedNode is nearestNode restricted to nodes on a high-speed line.
+// ok is false when the graph has none.
+func (g graph) nearestHighspeedNode(lat, lon float64) (best nodeKey, dist float64, ok bool) {
+	dist = math.Inf(1)
+	for n := range g {
+		if !g.nodeIsHighspeed(n) {
+			continue
+		}
+		if d := haversine(lat, lon, n.Lat, n.Lon); d < dist {
+			best, dist, ok = n, d, true
+		}
+	}
+	return best, dist, ok
+}
+
+// snapStation picks the graph node a station boards from. With preferHS on it
+// snaps to the nearest high-speed node when one is in range, so the route can
+// actually get onto the high-speed line; otherwise (or when none is near) it
+// snaps to the nearest node overall.
+func (g graph) snapStation(lat, lon float64, preferHS bool) (nodeKey, float64) {
+	if preferHS {
+		if n, d, ok := g.nearestHighspeedNode(lat, lon); ok && d <= maxSnapM {
+			return n, d
+		}
+	}
+	return g.nearestNode(lat, lon)
+}
+
+// edgeCost is the routing cost of traversing e: its true length, discounted
+// when preferHS is on and the edge is a high-speed line. The reported journey
+// distance uses e.weight directly, never this.
+func edgeCost(e edge, preferHS bool) float64 {
+	if preferHS && e.highspeed {
+		return e.weight * highspeedDiscount
+	}
+	return e.weight
+}
+
 // --- Dijkstra (min-heap) ---
 
 type pqItem struct {
@@ -659,7 +762,25 @@ type prevEdge struct {
 	geom []Point
 }
 
-func dijkstra(g graph, start, end nodeKey) ([]Point, float64, error) {
+// dijkstra routes from start to end, preferring a physically realistic train
+// path. It first runs the turn-aware search (which forbids sharp turns at
+// nodes); if that genuinely finds no path under the angle constraint, it falls
+// back to the plain shortest path so a routable pair is never reported as
+// disconnected. The fallback can reintroduce the straight "jumps" turn-aware
+// routing removes, but only on the rare graph where the sole physical
+// connection requires a move our angle cap rejects.
+func dijkstra(g graph, start, end nodeKey, preferHS bool) ([]Point, float64, error) {
+	coords, total, err := dijkstraTurnAware(g, start, end, preferHS)
+	if err == nil {
+		return coords, total, nil
+	}
+	if errors.Is(err, errTurnNoPath) {
+		return dijkstraPlain(g, start, end, preferHS)
+	}
+	return nil, 0, err
+}
+
+func dijkstraPlain(g graph, start, end nodeKey, preferHS bool) ([]Point, float64, error) {
 	dist := map[nodeKey]float64{start: 0}
 	prev := map[nodeKey]prevEdge{}
 	open := &pq{}
@@ -674,7 +795,7 @@ func dijkstra(g graph, start, end nodeKey) ([]Point, float64, error) {
 			continue
 		}
 		for _, e := range g[cur.node] {
-			nd := cur.dist + e.weight
+			nd := cur.dist + edgeCost(e, preferHS)
 			if old, ok := dist[e.to]; !ok || nd < old {
 				dist[e.to] = nd
 				prev[e.to] = prevEdge{from: cur.node, geom: e.geom}
@@ -718,7 +839,171 @@ func dijkstra(g graph, start, end nodeKey) ([]Point, float64, error) {
 			coords = append(coords, ch[1:]...)
 		}
 	}
-	return coords, dist[end], nil
+	// dist[end] is the routing cost, which the high-speed discount distorts;
+	// report the true track length measured off the stitched geometry instead.
+	total := 0.0
+	for i := 1; i < len(coords); i++ {
+		total += ptDist(coords[i-1], coords[i])
+	}
+	return coords, total, nil
+}
+
+// --- turn-aware (edge-based) routing ---
+
+// errTurnNoPath signals that the turn-restricted search found no route, so the
+// caller should fall back to plain shortest path. Distinct from a genuinely
+// disconnected graph (reported by dijkstraPlain) so the right error surfaces.
+var errTurnNoPath = errors.New("rail: no path under turn constraints")
+
+// edgeState is a search state for turn-aware routing: a node together with the
+// node we arrived from. The pair encodes arrival direction, which a plain
+// node-keyed state cannot — and turn cost depends on the (incoming, outgoing)
+// edge pair, not just the node.
+type edgeState struct {
+	at, from nodeKey
+}
+
+type turnPrev struct {
+	from edgeState
+	geom []Point
+	seed bool // boarding edge at the origin — has no predecessor state
+}
+
+type turnPQItem struct {
+	state  edgeState
+	inBear float64 // heading of travel arriving at state.at, degrees
+	cost   float64 // path cost incl. turn penalties (drives the heap)
+	meters float64 // true track length (penalty-free) for the reported distance
+	index  int
+}
+
+type turnPQ []*turnPQItem
+
+func (p turnPQ) Len() int           { return len(p) }
+func (p turnPQ) Less(i, j int) bool { return p[i].cost < p[j].cost }
+func (p turnPQ) Swap(i, j int)      { p[i], p[j] = p[j], p[i]; p[i].index = i; p[j].index = j }
+func (p *turnPQ) Push(x any)        { it := x.(*turnPQItem); it.index = len(*p); *p = append(*p, it) }
+func (p *turnPQ) Pop() any          { old := *p; n := len(old); it := old[n-1]; *p = old[:n-1]; return it }
+
+// bearing is the heading from a to b in degrees, using a local equirectangular
+// projection (longitude scaled by cos(mean lat)). Great-circle initial bearing
+// would be marginally more correct, but at the sub-kilometre segment lengths we
+// compare turns over, the planar heading is accurate to well under a degree.
+func bearing(a, b Point) float64 {
+	dLat := b.Latitude - a.Latitude
+	dLon := (b.Longitude - a.Longitude) * math.Cos((a.Latitude+b.Latitude)/2*math.Pi/180)
+	return math.Atan2(dLon, dLat) * 180 / math.Pi
+}
+
+// edgeStartBearing is the heading leaving the edge's first node (the departure
+// direction at a turn); edgeEndBearing is the heading arriving at its last node.
+func edgeStartBearing(e edge) float64 {
+	if len(e.geom) < 2 {
+		return 0
+	}
+	return bearing(e.geom[0], e.geom[1])
+}
+
+func edgeEndBearing(e edge) float64 {
+	n := len(e.geom)
+	if n < 2 {
+		return 0
+	}
+	return bearing(e.geom[n-2], e.geom[n-1])
+}
+
+// turnDeviation is the absolute heading change in degrees [0,180] between
+// arriving along inBear and departing along outBear: 0 is straight through,
+// 180 is a full reversal.
+func turnDeviation(inBear, outBear float64) float64 {
+	d := math.Mod(outBear-inBear+540, 360) - 180
+	return math.Abs(d)
+}
+
+// dijkstraTurnAware finds the lowest-cost path that never turns sharper than
+// maxTurnDeg at any node. Cost is track length plus a small per-degree turn
+// penalty (turnPenaltyM) that breaks ties toward the straighter continuation.
+// Returns errTurnNoPath if the constraint admits no route.
+func dijkstraTurnAware(g graph, start, end nodeKey, preferHS bool) ([]Point, float64, error) {
+	if start == end {
+		return nil, 0, errors.New("origin and destination resolve to the same rail node — pick stations further apart")
+	}
+	dist := map[edgeState]float64{}
+	prev := map[edgeState]turnPrev{}
+	open := &turnPQ{}
+	heap.Init(open)
+
+	// Seed: every edge leaving start is a valid boarding move — no turn
+	// constraint applies to the first edge.
+	for _, e := range g[start] {
+		st := edgeState{at: e.to, from: start}
+		c := edgeCost(e, preferHS)
+		if old, ok := dist[st]; ok && old <= c {
+			continue
+		}
+		dist[st] = c
+		prev[st] = turnPrev{geom: e.geom, seed: true}
+		heap.Push(open, &turnPQItem{state: st, inBear: edgeEndBearing(e), cost: c, meters: e.weight})
+	}
+
+	for open.Len() > 0 {
+		cur := heap.Pop(open).(*turnPQItem)
+		if cur.cost > dist[cur.state] {
+			continue
+		}
+		if cur.state.at == end {
+			return stitchTurnPath(prev, cur.state), cur.meters, nil
+		}
+		for _, e := range g[cur.state.at] {
+			dev := turnDeviation(cur.inBear, edgeStartBearing(e))
+			if dev > maxTurnDeg {
+				continue // physically impossible turn (crossing, reversal, hop)
+			}
+			st := edgeState{at: e.to, from: cur.state.at}
+			cost := cur.cost + edgeCost(e, preferHS) + dev*turnPenaltyM
+			if old, ok := dist[st]; ok && old <= cost {
+				continue
+			}
+			dist[st] = cost
+			prev[st] = turnPrev{from: cur.state, geom: e.geom}
+			heap.Push(open, &turnPQItem{
+				state:  st,
+				inBear: edgeEndBearing(e),
+				cost:   cost,
+				meters: cur.meters + e.weight,
+			})
+		}
+	}
+	return nil, 0, errTurnNoPath
+}
+
+// stitchTurnPath walks the prev chain from the goal state back to the boarding
+// edge and concatenates the segment geometries, dropping the shared junction
+// point between consecutive chunks (same dedup rationale as dijkstraPlain:
+// keyed on graph identity, not float equality).
+func stitchTurnPath(prev map[edgeState]turnPrev, goal edgeState) []Point {
+	var chunks [][]Point
+	st := goal
+	for {
+		p := prev[st]
+		chunks = append(chunks, p.geom)
+		if p.seed {
+			break
+		}
+		st = p.from
+	}
+	for i, j := 0, len(chunks)-1; i < j; i, j = i+1, j-1 {
+		chunks[i], chunks[j] = chunks[j], chunks[i]
+	}
+	var coords []Point
+	for i, ch := range chunks {
+		if i == 0 {
+			coords = append(coords, ch...)
+		} else if len(ch) > 1 {
+			coords = append(coords, ch[1:]...)
+		}
+	}
+	return coords
 }
 
 // --- top-level orchestrator ---
@@ -734,7 +1019,7 @@ const synthDuration = 120 * time.Minute
 //
 // `start` is the journey UTC start time — used only as the first `<when>`
 // inside the gx:Track. Fog of World ignores it.
-func (c *Client) GenerateFromCoords(ctx context.Context, src, dst Station, start time.Time) (*Result, error) {
+func (c *Client) GenerateFromCoords(ctx context.Context, src, dst Station, start time.Time, preferHS bool) (*Result, error) {
 	ways, err := c.FetchRailNetwork(ctx, src, dst)
 	if err != nil {
 		return nil, err
@@ -743,20 +1028,19 @@ func (c *Client) GenerateFromCoords(ctx context.Context, src, dst Station, start
 	if len(g) == 0 {
 		return nil, errors.New("no rail ways found in bbox — OSM coverage may be missing here")
 	}
-	srcNode, srcSnap := g.nearestNode(src.Latitude, src.Longitude)
-	dstNode, dstSnap := g.nearestNode(dst.Latitude, dst.Longitude)
-	const maxSnap = 5000.0 // metres
-	if srcSnap > maxSnap || dstSnap > maxSnap {
+	srcNode, srcSnap := g.snapStation(src.Latitude, src.Longitude, preferHS)
+	dstNode, dstSnap := g.snapStation(dst.Latitude, dst.Longitude, preferHS)
+	if srcSnap > maxSnapM || dstSnap > maxSnapM {
 		return nil, fmt.Errorf("station too far from mapped rail (start %.0f m, end %.0f m) — bbox may not contain a connecting line", srcSnap, dstSnap)
 	}
 	if srcNode == dstNode {
 		return nil, fmt.Errorf("origin and destination snap to the same rail node (%q and %q are too close to distinguish on OSM rail)", src.Name, dst.Name)
 	}
-	coords, total, err := dijkstra(g, srcNode, dstNode)
+	coords, total, err := dijkstra(g, srcNode, dstNode, preferHS)
 	if err != nil {
 		return nil, err
 	}
-	coords = densify(coords, densifyTargetM)
+	coords = smooth(coords, densifyTargetM)
 	timestamps := synthTimestamps(len(coords), start, synthDuration)
 	for i := range coords {
 		coords[i].Timestamp = timestamps[i]
@@ -774,11 +1058,129 @@ func (c *Client) GenerateFromCoords(ctx context.Context, src, dst Station, start
 	}, nil
 }
 
-// densify inserts linearly-interpolated points between any consecutive pair
-// whose great-circle distance exceeds targetM. Cheap linear interp in lat/lon
-// is accurate to centimeters at the sub-kilometer step sizes we use here,
-// which is well below KML's `%.5f` (~1 m) write precision.
-func densify(coords []Point, targetM float64) []Point {
+// smooth resamples a routed polyline with a centripetal Catmull-Rom spline
+// (catmullAlpha = 0.5), rounding the polygonal corners left by stitched OSM
+// ways — and the small jogs at junctions — without ever looping back on the
+// track (centripetal is the only parameterisation proven free of cusps and
+// self-intersections). It subsumes the old linear densify: each segment is
+// sampled so the chord between samples is <= targetM (the curve between them
+// runs marginally longer — a few tens of metres on the sharpest bends), which
+// keeps every ~1.1 km Fog of World tile along the route covered.
+//
+// The spline passes exactly through the first and last points (the snapped
+// stations) via reflected boundary tangents. Collinear input stays collinear:
+// a straight OSM tunnel/viaduct chord is densified but never bent, because OSM
+// has no intermediate geometry there to curve toward — recovering it needs a
+// data source this package doesn't use.
+func smooth(coords []Point, targetM float64) []Point {
+	pts := dedupeConsecutive(coords)
+	if len(pts) < 3 || targetM <= 0 {
+		// 0/1/2 distinct points: nothing to curve. Linear fill still meets the
+		// tile-spacing guarantee (e.g. a 2-point route or a bare tunnel chord).
+		return densifyLinear(pts, targetM)
+	}
+	out := make([]Point, 0, len(pts))
+	out = append(out, pts[0])
+	for i := 0; i+1 < len(pts); i++ {
+		p1, p2 := pts[i], pts[i+1]
+		// Reflect the endpoint tangents so the boundary knots are non-zero
+		// (clamping by duplication would divide by zero) while the curve still
+		// interpolates p1 and p2 exactly.
+		p0 := reflect(p2, p1)
+		if i > 0 {
+			p0 = pts[i-1]
+		}
+		p3 := reflect(p1, p2)
+		if i+2 < len(pts) {
+			p3 = pts[i+2]
+		}
+		out = append(out, catmullRomSegment(p0, p1, p2, p3, targetM)...)
+	}
+	return out
+}
+
+// reflect mirrors `from` across `pivot` (pivot + (pivot - from)), giving a
+// phantom control point collinear with the boundary segment.
+func reflect(from, pivot Point) Point {
+	return Point{
+		Latitude:  2*pivot.Latitude - from.Latitude,
+		Longitude: 2*pivot.Longitude - from.Longitude,
+	}
+}
+
+// catmullRomSegment samples the centripetal Catmull-Rom curve between p1 and p2
+// (with neighbours p0, p3) at <= targetM spacing. The returned slice excludes
+// p1 and includes p2, so callers append it after the running point.
+func catmullRomSegment(p0, p1, p2, p3 Point, targetM float64) []Point {
+	t0 := 0.0
+	t1 := t0 + math.Pow(ptDist(p0, p1), catmullAlpha)
+	t2 := t1 + math.Pow(ptDist(p1, p2), catmullAlpha)
+	t3 := t2 + math.Pow(ptDist(p2, p3), catmullAlpha)
+	// Coincident control points collapse a knot interval; fall back to a
+	// straight fill rather than divide by zero.
+	if t1 == t0 || t2 == t1 || t3 == t2 {
+		return densifyLinear([]Point{p1, p2}, targetM)[1:]
+	}
+	n := int(math.Ceil(ptDist(p1, p2) / targetM))
+	if n < 1 {
+		n = 1
+	}
+	out := make([]Point, 0, n)
+	for k := 1; k <= n; k++ {
+		t := t1 + (t2-t1)*float64(k)/float64(n)
+		out = append(out, catmullRomAt(p0, p1, p2, p3, t0, t1, t2, t3, t))
+	}
+	return out
+}
+
+// catmullRomAt evaluates the curve at parameter t using the Barry-Goldman
+// pyramidal form, interpolating latitude and longitude independently.
+func catmullRomAt(p0, p1, p2, p3 Point, t0, t1, t2, t3, t float64) Point {
+	a1 := lerpPt(p0, p1, (t1-t)/(t1-t0))
+	a2 := lerpPt(p1, p2, (t2-t)/(t2-t1))
+	a3 := lerpPt(p2, p3, (t3-t)/(t3-t2))
+	b1 := lerpPt(a1, a2, (t2-t)/(t2-t0))
+	b2 := lerpPt(a2, a3, (t3-t)/(t3-t1))
+	return lerpPt(b1, b2, (t2-t)/(t2-t1))
+}
+
+// lerpPt returns wa*a + (1-wa)*b component-wise.
+func lerpPt(a, b Point, wa float64) Point {
+	wb := 1 - wa
+	return Point{
+		Latitude:  wa*a.Latitude + wb*b.Latitude,
+		Longitude: wa*a.Longitude + wb*b.Longitude,
+	}
+}
+
+func ptDist(a, b Point) float64 {
+	return haversine(a.Latitude, a.Longitude, b.Latitude, b.Longitude)
+}
+
+// dedupeConsecutive drops points identical to their predecessor so smoothing
+// never sees a zero-length segment (which would collapse a Catmull-Rom knot).
+func dedupeConsecutive(coords []Point) []Point {
+	if len(coords) < 2 {
+		return coords
+	}
+	out := make([]Point, 0, len(coords))
+	out = append(out, coords[0])
+	for i := 1; i < len(coords); i++ {
+		last := out[len(out)-1]
+		if coords[i].Latitude == last.Latitude && coords[i].Longitude == last.Longitude {
+			continue
+		}
+		out = append(out, coords[i])
+	}
+	return out
+}
+
+// densifyLinear inserts linearly-interpolated points between any consecutive
+// pair whose great-circle distance exceeds targetM. Used for the degenerate
+// (<3-point) cases smooth() can't curve, and as the zero-knot fallback inside a
+// segment. Cheap linear interp in lat/lon is accurate to centimeters at the
+// sub-kilometer step sizes here, well below KML's `%.5f` (~1 m) write precision.
+func densifyLinear(coords []Point, targetM float64) []Point {
 	if len(coords) < 2 || targetM <= 0 {
 		return coords
 	}
