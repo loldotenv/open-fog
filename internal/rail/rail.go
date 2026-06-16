@@ -34,20 +34,35 @@ var overpassMirrors = []string{
 
 // Overpass fetch budget. Public mirrors are slow and frequently hang, and the
 // whole rail request runs inside a serverless function capped at 300 s (the
-// Vercel Hobby ceiling, fluid compute enabled). The sum of all mirror attempts
-// plus graph building must finish under that — otherwise the platform hard-
+// Vercel Hobby ceiling, fluid compute enabled). Everything — all mirror
+// attempts plus graph building — must finish under that, or the platform hard-
 // kills the function with an opaque 504 before the mirror fallback or our own
-// error messages ever run. Tries are sequential, so without a per-try cap a
-// single hung mirror eats the entire budget.
+// error messages ever run.
+//
+// Mirrors are queried with hedged requests rather than strict sequential
+// fallback: we start the first mirror and, if it hasn't answered within
+// overpassHedge, fire the next one concurrently and take whichever responds
+// first (a failed attempt brings in the next immediately, without waiting out
+// the hedge). A single congested or hung mirror no longer blocks the request
+// for a full per-try timeout before the next is tried, so the documented
+// 30–90 s tail — and the 504 it caused — collapses to roughly one hedge plus a
+// healthy mirror's response time.
 const (
-	// overpassPerTry caps one mirror attempt. Legitimate rail-network queries
-	// take 30–90 s; 75 s covers the common case and bails on a hung mirror
-	// fast enough to fall through to the next one within budget.
+	// overpassPerTry caps a single mirror attempt. Legitimate rail-network
+	// queries take ~10–90 s depending on bbox size and mirror load; 75 s covers
+	// the slow case and abandons a hung mirror within budget.
 	overpassPerTry = 75 * time.Second
 
-	// overpassBudget caps total wall-clock across all mirror attempts. With 3
-	// mirrors × 75 s = 225 s this leaves ~75 s of the 300 s function ceiling
-	// for JSON decode, graph build, Dijkstra, densify, and the response.
+	// overpassHedge is how long an in-flight mirror has to answer before we also
+	// launch the next one. Healthy mirrors return a typical inter-city query in
+	// well under this (a large bbox measured ~10 s on a warm mirror), so the
+	// common case still issues a single request; a mirror slower than this gets
+	// raced instead of waited out.
+	overpassHedge = 15 * time.Second
+
+	// overpassBudget caps total wall-clock across all (now overlapping) mirror
+	// attempts. Leaves ~70 s of the 300 s function ceiling for JSON decode,
+	// graph build, Dijkstra, densify, and the response.
 	overpassBudget = 230 * time.Second
 )
 
@@ -116,11 +131,13 @@ type Client struct {
 	HTTP    *http.Client
 	Mirrors []string
 
-	// perTry / budget bound the Overpass fetch (defaults: overpassPerTry /
-	// overpassBudget). Fields rather than direct const use so tests can drive
-	// the fallback and budget logic without real-time waits; zero means default.
+	// perTry / budget / hedge bound the Overpass fetch (defaults: overpassPerTry
+	// / overpassBudget / overpassHedge). Fields rather than direct const use so
+	// tests can drive the hedge and budget logic without real-time waits; zero
+	// means default.
 	perTry time.Duration
 	budget time.Duration
+	hedge  time.Duration
 }
 
 func New() *Client {
@@ -130,8 +147,8 @@ func New() *Client {
 		// is only an absolute backstop, kept under the 300 s function ceiling.
 		HTTP:    &http.Client{Timeout: overpassBudget},
 		Mirrors: overpassMirrors,
-		// perTry/budget left zero — query() falls back to the consts. Tests set
-		// them to drive the budget logic without real-time waits.
+		// perTry/budget/hedge left zero — query() falls back to the consts. Tests
+		// set them to drive the hedge and budget logic without real-time waits.
 	}
 }
 
@@ -155,46 +172,96 @@ type overpassGeomPt struct {
 }
 
 func (c *Client) query(ctx context.Context, q string) (*overpassResp, error) {
-	perTry, budget := c.perTry, c.budget
+	perTry, budget, hedge := c.perTry, c.budget, c.hedge
 	if perTry == 0 {
 		perTry = overpassPerTry
 	}
 	if budget == 0 {
 		budget = overpassBudget
 	}
-	deadline := time.Now().Add(budget)
-	var lastErr error
-	for _, endpoint := range c.Mirrors {
-		// Stop before starting another attempt if the caller cancelled (e.g.
-		// the function deadline fired) — a clean ctx error beats running into
-		// the platform's hard 300 s kill.
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break // total budget spent; don't start a doomed attempt.
-		}
-		try := perTry
-		if remaining < try {
-			try = remaining
-		}
-		// Per-mirror deadline: a hung mirror is abandoned at `try` and we fall
-		// through to the next one. This is a per-try timeout, not a caller
-		// cancellation, so its error must NOT abort the loop.
-		tctx, cancel := context.WithTimeout(ctx, try)
-		v, err := c.queryOne(tctx, endpoint, q)
-		cancel()
-		if err == nil {
-			return v, nil
-		}
-		lastErr = err
+	if hedge == 0 {
+		hedge = overpassHedge
 	}
+	if len(c.Mirrors) == 0 {
+		return nil, errors.New("overpass: no mirrors configured")
+	}
+
+	// One budget-bounded context shared by every hedged attempt. Returning a
+	// winner fires the deferred cancel, which tears down the losing attempts so
+	// their goroutines stop hammering the public mirrors and exit.
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
+	type result struct {
+		resp *overpassResp
+		err  error
+	}
+	// Buffered to len(Mirrors): a losing goroutine must always be able to
+	// deliver its result and exit, even after a winner has already returned.
+	results := make(chan result, len(c.Mirrors))
+
+	next, inFlight := 0, 0
+	launchNext := func() {
+		if next >= len(c.Mirrors) {
+			return
+		}
+		endpoint := c.Mirrors[next]
+		next++
+		inFlight++
+		go func() {
+			// Per-mirror deadline within the shared budget: a hung mirror is
+			// abandoned at perTry while the others keep racing.
+			tctx, tcancel := context.WithTimeout(ctx, perTry)
+			defer tcancel()
+			v, err := c.queryOne(tctx, endpoint, q)
+			results <- result{v, err}
+		}()
+	}
+
+	hedgeTimer := time.NewTimer(hedge)
+	defer hedgeTimer.Stop()
+	resetHedge := func() {
+		if !hedgeTimer.Stop() {
+			select {
+			case <-hedgeTimer.C:
+			default:
+			}
+		}
+		hedgeTimer.Reset(hedge)
+	}
+
+	launchNext()
+	var lastErr error
+	for inFlight > 0 {
+		select {
+		case <-ctx.Done():
+			// Budget spent or caller cancelled (e.g. the function deadline
+			// fired) — a clean ctx error beats running into the platform's
+			// hard 300 s kill.
+			return nil, ctx.Err()
+		case <-hedgeTimer.C:
+			// The leading mirror is slow; race the next one rather than wait it
+			// out. The slow attempt keeps running — it may still win.
+			launchNext()
+			resetHedge()
+		case res := <-results:
+			inFlight--
+			if res.err == nil {
+				return res.resp, nil
+			}
+			// A mirror failed (per-try timeout, 429, decode error). Don't wait
+			// for the hedge — bring in the next mirror immediately.
+			lastErr = res.err
+			launchNext()
+			resetHedge()
+		}
+	}
+
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
 	if lastErr == nil {
-		lastErr = errors.New("overpass: no mirror attempted within budget")
+		lastErr = errors.New("overpass: no mirror succeeded within budget")
 	}
 	return nil, lastErr
 }
