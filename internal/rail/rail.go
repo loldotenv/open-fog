@@ -3,12 +3,16 @@
 // `railway=rail|narrow_gauge` ways inside a bbox around the two stations
 // and routes the shortest path over that subgraph.
 //
-// All data comes from the Overpass API (OpenStreetMap mirror). No train
-// operator API, no GPS log — just the physical track right-of-way as mapped
-// in OSM.
+// All data comes from OpenStreetMap. The rail geometry is fetched from QLever
+// (an indexed SPARQL endpoint over the full OSM planet) — it returns the same
+// `railway=rail|narrow_gauge` ways as Overpass but several times faster and with
+// a fraction of the payload, and without the public-mirror flakiness. Overpass
+// is kept as a fallback. No train operator API, no GPS log — just the physical
+// track right-of-way as mapped in OSM.
 package rail
 
 import (
+	"bufio"
 	"container/heap"
 	"context"
 	"encoding/json"
@@ -19,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,6 +36,23 @@ var overpassMirrors = []string{
 	"https://overpass.kumi.systems/api/interpreter",
 	"https://overpass.private.coffee/api/interpreter",
 }
+
+// qleverEndpoint is the public QLever SPARQL endpoint over the complete OSM
+// planet. It is the primary rail-geometry source: a bbox query that takes
+// Overpass 25–90 s (or 504s on large inter-city boxes) returns here in well
+// under 10 s, with the same coverage. It is a free academic service with no
+// availability SLA, which is exactly why Overpass is retained as a fallback.
+const qleverEndpoint = "https://qlever.dev/api/osm-planet"
+
+// qleverTimeout abandons a slow/hung QLever request and falls back to Overpass.
+// Real queries (even a ~2000 km inter-city bbox) measured under 10 s; 45 s is a
+// generous ceiling that still leaves room for the Overpass fallback plus graph
+// build inside the 300 s function deadline.
+const qleverTimeout = 45 * time.Second
+
+// userAgent identifies us to the public data endpoints. QLever and Overpass
+// mirrors both rate-limit anonymous/default user agents.
+const userAgent = "open-fog/0.1 (rail-route; github.com/loldotenv/open-fog)"
 
 // Overpass fetch budget. Public mirrors are slow and frequently hang, and the
 // whole rail request runs inside a serverless function capped at 300 s (the
@@ -179,10 +201,14 @@ type Result struct {
 	DistanceKM  float64 `json:"distanceKm"`
 }
 
-// Client is an Overpass-API client. Safe for concurrent use.
+// Client fetches OSM rail geometry (QLever primary, Overpass fallback) and
+// geocodes stations (Photon). Safe for concurrent use.
 type Client struct {
 	HTTP    *http.Client
 	Mirrors []string
+	// QLever is the SPARQL endpoint queried first for rail geometry; empty
+	// falls back to qleverEndpoint. A field so tests can point it at a stub.
+	QLever string
 
 	// perTry / budget / hedge bound the Overpass fetch (defaults: overpassPerTry
 	// / overpassBudget / overpassHedge). Fields rather than direct const use so
@@ -200,6 +226,7 @@ func New() *Client {
 		// is only an absolute backstop, kept under the 300 s function ceiling.
 		HTTP:    &http.Client{Timeout: overpassBudget},
 		Mirrors: overpassMirrors,
+		QLever:  qleverEndpoint,
 		// perTry/budget/hedge left zero — query() falls back to the consts. Tests
 		// set them to drive the hedge and budget logic without real-time waits.
 	}
@@ -525,11 +552,30 @@ func formatRegion(city, county, state, country string) string {
 // FetchRailNetwork pulls every mainline railway way in a padded bbox around
 // the two stations. `service`-tagged ways (yards, sidings, spurs) are filtered
 // out so Dijkstra doesn't shortcut through depot tracks.
+//
+// QLever is queried first; on any error (timeout, outage, malformed response)
+// it falls back to Overpass so a QLever problem degrades to the slower path
+// instead of failing the request outright.
 func (c *Client) FetchRailNetwork(ctx context.Context, a, b Station) (*overpassResp, error) {
 	south := math.Min(a.Latitude, b.Latitude) - bboxPadDeg
 	west := math.Min(a.Longitude, b.Longitude) - bboxPadDeg
 	north := math.Max(a.Latitude, b.Latitude) + bboxPadDeg
 	east := math.Max(a.Longitude, b.Longitude) + bboxPadDeg
+
+	resp, qlErr := c.fetchQLever(ctx, south, west, north, east)
+	if qlErr == nil {
+		return resp, nil
+	}
+	resp, opErr := c.fetchOverpass(ctx, south, west, north, east)
+	if opErr == nil {
+		return resp, nil
+	}
+	return nil, fmt.Errorf("rail network fetch failed (qlever: %v) (overpass: %w)", qlErr, opErr)
+}
+
+// fetchOverpass is the fallback path: the original bbox query against the
+// Overpass mirrors via the hedged query() machinery.
+func (c *Client) fetchOverpass(ctx context.Context, south, west, north, east float64) (*overpassResp, error) {
 	// Overpass [timeout:] is the server-side execution cap; match it to the
 	// per-mirror client deadline so the mirror gives up around the same time we
 	// do instead of grinding on a query we've already abandoned.
@@ -537,6 +583,150 @@ func (c *Client) FetchRailNetwork(ctx context.Context, a, b Station) (*overpassR
 way["railway"~"^(rail|narrow_gauge)$"][!"service"];
 out geom;`, int(overpassPerTry/time.Second), south, west, north, east)
 	return c.query(ctx, q)
+}
+
+// fetchQLever runs the bbox rail query against QLever and maps the TSV result
+// into the same overpassResp shape buildGraph already consumes, so nothing
+// downstream of the fetch changes.
+func (c *Client) fetchQLever(ctx context.Context, south, west, north, east float64) (*overpassResp, error) {
+	endpoint := c.QLever
+	if endpoint == "" {
+		endpoint = qleverEndpoint
+	}
+	rctx, cancel := context.WithTimeout(ctx, qleverTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(rctx, http.MethodPost, endpoint,
+		strings.NewReader(qleverRailQuery(south, west, north, east)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("content-type", "application/sparql-query")
+	req.Header.Set("accept", "text/tab-separated-values")
+	req.Header.Set("user-agent", userAgent)
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("qlever: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("qlever %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return parseQLeverTSV(resp.Body)
+}
+
+// qleverRailQuery builds the SPARQL for every rail|narrow_gauge way intersecting
+// the bbox, excluding service tracks, carrying the highspeed tag. The bbox is a
+// WKT polygon in lon-lat (X Y) order. The spatial join SERVICE (libspatialjoin)
+// is used rather than a geof:sfIntersects FILTER because only the former is
+// index-accelerated — a plain filter scans the entire planet's geometry.
+func qleverRailQuery(south, west, north, east float64) string {
+	poly := fmt.Sprintf("POLYGON((%f %f,%f %f,%f %f,%f %f,%f %f))",
+		west, south, east, south, east, north, west, north, west, south)
+	return fmt.Sprintf(`PREFIX osmkey: <https://www.openstreetmap.org/wiki/Key:>
+PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+PREFIX qlss: <https://qlever.cs.uni-freiburg.de/spatialSearch/>
+SELECT ?way ?hs ?wkt WHERE {
+  BIND("%s"^^geo:wktLiteral AS ?bbox)
+  SERVICE qlss: {
+    _:config qlss:algorithm qlss:libspatialjoin ;
+             qlss:left ?bbox ; qlss:right ?wkt ;
+             qlss:joinType qlss:intersects ; qlss:payload ?way , ?hs .
+    {
+      ?way osmkey:railway ?railway .
+      FILTER(?railway = "rail" || ?railway = "narrow_gauge")
+      FILTER NOT EXISTS { ?way osmkey:service ?svc }
+      ?way geo:hasGeometry ?geom .
+      ?geom geo:asWKT ?wkt .
+      OPTIONAL { ?way osmkey:highspeed ?hs }
+    }
+  }
+}`, poly)
+}
+
+// parseQLeverTSV maps the QLever TSV result (one row per way: IRI, highspeed,
+// WKT geometry) into overpassResp. Rows whose geometry isn't a parseable
+// LINESTRING/POLYGON, or has fewer than two points, are skipped — they can't
+// contribute a routing edge. A bufio.Reader (not Scanner) is used because a
+// single dense way's WKT can exceed Scanner's default line cap.
+func parseQLeverTSV(r io.Reader) (*overpassResp, error) {
+	br := bufio.NewReaderSize(r, 1<<20)
+	// Discard the header row (?way ?hs ?wkt).
+	if _, err := br.ReadString('\n'); err != nil {
+		if err == io.EOF {
+			return nil, errors.New("qlever: empty response")
+		}
+		return nil, fmt.Errorf("qlever read: %w", err)
+	}
+
+	var resp overpassResp
+	for {
+		line, err := br.ReadString('\n')
+		if line = strings.TrimRight(line, "\r\n"); line != "" {
+			cols := strings.SplitN(line, "\t", 3)
+			if len(cols) == 3 {
+				if pts := parseWKTLine(cols[2]); len(pts) >= 2 {
+					el := overpassElem{Type: "way", Geometry: pts}
+					if strings.Trim(cols[1], `"`) == "yes" {
+						el.Tags = map[string]string{"highspeed": "yes"}
+					}
+					resp.Elements = append(resp.Elements, el)
+				}
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("qlever read: %w", err)
+		}
+	}
+	if len(resp.Elements) == 0 {
+		return nil, errors.New("qlever: no rail ways in response")
+	}
+	return &resp, nil
+}
+
+// parseWKTLine extracts the coordinate list from a QLever WKT geometry literal,
+// e.g. `"LINESTRING(lon lat,lon lat,...)"^^<...wktLiteral>` (or POLYGON for a
+// closed loop), returning points in OSM lat/lon order. WKT is X Y, so the first
+// number is longitude and the second latitude. Only LINESTRING and POLYGON are
+// accepted; POINT (stray nodes) and MULTI*/collections are rejected — they
+// either can't form an edge or need geometry handling this router doesn't do.
+func parseWKTLine(field string) []overpassGeomPt {
+	open := strings.IndexByte(field, '(')
+	if open < 0 {
+		return nil
+	}
+	switch typ := strings.TrimSpace(strings.TrimLeft(field[:open], `"`)); typ {
+	case "LINESTRING", "POLYGON":
+	default:
+		return nil
+	}
+	end := strings.LastIndexByte(field, ')')
+	if end <= open {
+		return nil
+	}
+	// Trim the wrapping paren(s): "(...)" for LINESTRING, "((...))" for POLYGON.
+	body := strings.Trim(field[open:end+1], "()")
+
+	parts := strings.Split(body, ",")
+	pts := make([]overpassGeomPt, 0, len(parts))
+	for _, p := range parts {
+		xy := strings.Fields(p)
+		if len(xy) < 2 {
+			continue
+		}
+		lon, err1 := strconv.ParseFloat(xy[0], 64)
+		lat, err2 := strconv.ParseFloat(xy[1], 64)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		pts = append(pts, overpassGeomPt{Lat: lat, Lon: lon})
+	}
+	return pts
 }
 
 // --- graph / routing ----------------------------------------------------
@@ -581,15 +771,26 @@ func haversine(aLat, aLon, bLat, bLon float64) float64 {
 }
 
 // buildGraph turns Overpass ways into an undirected weighted graph. After
-// per-way edges are added, any two nodes within bridgeToleranceM are
-// connected with a zero-distance bridge edge so adjacent OSM ways that don't
-// share an exact endpoint coordinate still route across the junction.
+// per-way edges are added, way endpoints within bridgeToleranceM of each other
+// are connected with a short bridge edge so adjacent OSM ways that don't share
+// an exact endpoint coordinate still route across the junction.
+//
+// Only endpoints (a way's first/last node) are bridge candidates. Interior
+// nodes are already connected along their own way, so bridging them would only
+// cross-link parallel tracks that happen to run within tolerance — which is both
+// wrong (a train can't teleport between parallel lines) and catastrophic for
+// performance: in a dense metro it inflates node degree into the hundreds and
+// turns the turn-aware search's edge-state space into tens of millions.
 func buildGraph(ways *overpassResp) graph {
 	g := make(graph)
+	endpoints := make(map[nodeKey]bool)
 	for _, el := range ways.Elements {
 		if el.Type != "way" || len(el.Geometry) < 2 {
 			continue
 		}
+		first, last := el.Geometry[0], el.Geometry[len(el.Geometry)-1]
+		endpoints[keyOf(first.Lat, first.Lon)] = true
+		endpoints[keyOf(last.Lat, last.Lon)] = true
 		hs := el.Tags["highspeed"] == "yes"
 		for i := 0; i < len(el.Geometry)-1; i++ {
 			a, b := el.Geometry[i], el.Geometry[i+1]
@@ -608,11 +809,15 @@ func buildGraph(ways *overpassResp) graph {
 			})
 		}
 	}
-	bridgeNearby(g)
+	bridgeNearby(g, endpoints)
 	return g
 }
 
-func bridgeNearby(g graph) {
+// bridgeNearby connects way endpoints that lie within bridgeToleranceM of each
+// other but aren't already linked, closing sub-rounding gaps at junctions. Only
+// the endpoints set is considered (see buildGraph) — bridging every nearby node
+// would cross-link parallel tracks and explode search cost.
+func bridgeNearby(g graph, endpoints map[nodeKey]bool) {
 	cellSizeLat := bridgeToleranceM / 111000.0 // ~degrees latitude
 	// Lon meters-per-degree shrinks with cos(lat); using cellSizeLat for both
 	// dimensions makes lon-cells too narrow at high latitudes, so the ±1-cell
@@ -636,11 +841,11 @@ func bridgeNearby(g graph) {
 		return cell{int(math.Floor(lat / cellSizeLat)), int(math.Floor(lon / cellSizeLon))}
 	}
 	grid := make(map[cell][]nodeKey)
-	for n := range g {
+	for n := range endpoints {
 		k := cellOf(n.Lat, n.Lon)
 		grid[k] = append(grid[k], n)
 	}
-	for n := range g {
+	for n := range endpoints {
 		c := cellOf(n.Lat, n.Lon)
 		for dx := -1; dx <= 1; dx++ {
 			for dy := -1; dy <= 1; dy++ {
@@ -741,21 +946,40 @@ func edgeCost(e edge, preferHS bool) float64 {
 	return e.weight
 }
 
-// --- Dijkstra (min-heap) ---
+// --- A* (min-heap) ---
+
+// hCostToGoal is the A* heuristic: an admissible lower bound on the remaining
+// routing cost from n to end. It is the straight-line (great-circle) distance,
+// scaled by the high-speed discount when preferHS is on — a high-speed edge can
+// cost as little as highspeedDiscount × its length, so the cheapest conceivable
+// remaining cost is highspeedDiscount × the straight-line distance. Turn
+// penalties only add cost, so the bound stays admissible (and consistent), which
+// means A* returns the same optimal path plain Dijkstra would — but with far
+// fewer expansions, because it heads toward the goal instead of flooding
+// outward. On a dense inter-city graph that is the difference between exploring a
+// whole country's rail (~minutes) and just the corridor (~seconds).
+func hCostToGoal(n, end nodeKey, preferHS bool) float64 {
+	h := haversine(n.Lat, n.Lon, end.Lat, end.Lon)
+	if preferHS {
+		return h * highspeedDiscount
+	}
+	return h
+}
 
 type pqItem struct {
 	node  nodeKey
-	dist  float64
+	g     float64 // cost from start (compared against dist[node])
+	f     float64 // g + hCostToGoal; the A* priority
 	index int
 }
 
 type pq []*pqItem
 
-func (p pq) Len() int            { return len(p) }
-func (p pq) Less(i, j int) bool  { return p[i].dist < p[j].dist }
-func (p pq) Swap(i, j int)       { p[i], p[j] = p[j], p[i]; p[i].index = i; p[j].index = j }
-func (p *pq) Push(x any)         { it := x.(*pqItem); it.index = len(*p); *p = append(*p, it) }
-func (p *pq) Pop() any           { old := *p; n := len(old); it := old[n-1]; *p = old[:n-1]; return it }
+func (p pq) Len() int           { return len(p) }
+func (p pq) Less(i, j int) bool { return p[i].f < p[j].f }
+func (p pq) Swap(i, j int)      { p[i], p[j] = p[j], p[i]; p[i].index = i; p[j].index = j }
+func (p *pq) Push(x any)        { it := x.(*pqItem); it.index = len(*p); *p = append(*p, it) }
+func (p *pq) Pop() any          { old := *p; n := len(old); it := old[n-1]; *p = old[:n-1]; return it }
 
 type prevEdge struct {
 	from nodeKey
@@ -785,21 +1009,21 @@ func dijkstraPlain(g graph, start, end nodeKey, preferHS bool) ([]Point, float64
 	prev := map[nodeKey]prevEdge{}
 	open := &pq{}
 	heap.Init(open)
-	heap.Push(open, &pqItem{node: start, dist: 0})
+	heap.Push(open, &pqItem{node: start, g: 0, f: hCostToGoal(start, end, preferHS)})
 	for open.Len() > 0 {
 		cur := heap.Pop(open).(*pqItem)
 		if cur.node == end {
 			break
 		}
-		if cur.dist > dist[cur.node] {
+		if cur.g > dist[cur.node] {
 			continue
 		}
 		for _, e := range g[cur.node] {
-			nd := cur.dist + edgeCost(e, preferHS)
+			nd := cur.g + edgeCost(e, preferHS)
 			if old, ok := dist[e.to]; !ok || nd < old {
 				dist[e.to] = nd
 				prev[e.to] = prevEdge{from: cur.node, geom: e.geom}
-				heap.Push(open, &pqItem{node: e.to, dist: nd})
+				heap.Push(open, &pqItem{node: e.to, g: nd, f: nd + hCostToGoal(e.to, end, preferHS)})
 			}
 		}
 	}
@@ -872,7 +1096,8 @@ type turnPrev struct {
 type turnPQItem struct {
 	state  edgeState
 	inBear float64 // heading of travel arriving at state.at, degrees
-	cost   float64 // path cost incl. turn penalties (drives the heap)
+	cost   float64 // path cost incl. turn penalties (g; compared against dist[state])
+	f      float64 // cost + hCostToGoal; the A* priority
 	meters float64 // true track length (penalty-free) for the reported distance
 	index  int
 }
@@ -880,7 +1105,7 @@ type turnPQItem struct {
 type turnPQ []*turnPQItem
 
 func (p turnPQ) Len() int           { return len(p) }
-func (p turnPQ) Less(i, j int) bool { return p[i].cost < p[j].cost }
+func (p turnPQ) Less(i, j int) bool { return p[i].f < p[j].f }
 func (p turnPQ) Swap(i, j int)      { p[i], p[j] = p[j], p[i]; p[i].index = i; p[j].index = j }
 func (p *turnPQ) Push(x any)        { it := x.(*turnPQItem); it.index = len(*p); *p = append(*p, it) }
 func (p *turnPQ) Pop() any          { old := *p; n := len(old); it := old[n-1]; *p = old[:n-1]; return it }
@@ -943,7 +1168,7 @@ func dijkstraTurnAware(g graph, start, end nodeKey, preferHS bool) ([]Point, flo
 		}
 		dist[st] = c
 		prev[st] = turnPrev{geom: e.geom, seed: true}
-		heap.Push(open, &turnPQItem{state: st, inBear: edgeEndBearing(e), cost: c, meters: e.weight})
+		heap.Push(open, &turnPQItem{state: st, inBear: edgeEndBearing(e), cost: c, f: c + hCostToGoal(st.at, end, preferHS), meters: e.weight})
 	}
 
 	for open.Len() > 0 {
@@ -970,6 +1195,7 @@ func dijkstraTurnAware(g graph, start, end nodeKey, preferHS bool) ([]Point, flo
 				state:  st,
 				inBear: edgeEndBearing(e),
 				cost:   cost,
+				f:      cost + hCostToGoal(st.at, end, preferHS),
 				meters: cur.meters + e.weight,
 			})
 		}

@@ -3,6 +3,7 @@ package rail
 import (
 	"errors"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -183,8 +184,8 @@ func TestHighspeedPreference(t *testing.T) {
 // otherwise the cost discount is unreachable (the connector would be a
 // turn-forbidden near-perpendicular hop).
 func TestSnapStationPrefersHighspeed(t *testing.T) {
-	conventional := wayElem([2]float64{0, 0}, [2]float64{0, 0.01})       // node (0,0) sits on the query point
-	highspeed := hsWay([2]float64{0.002, 0}, [2]float64{0.002, 0.01})    // ~222 m away, highspeed
+	conventional := wayElem([2]float64{0, 0}, [2]float64{0, 0.01})    // node (0,0) sits on the query point
+	highspeed := hsWay([2]float64{0.002, 0}, [2]float64{0.002, 0.01}) // ~222 m away, highspeed
 	g := testGraph(conventional, highspeed)
 
 	if n, _ := g.snapStation(0, 0, true); !g.nodeIsHighspeed(n) {
@@ -257,4 +258,114 @@ func TestSmooth(t *testing.T) {
 		}
 		assertSpacingAndFinite(t, out)
 	})
+}
+
+// wktType is the datatype suffix QLever appends to every WKT literal in TSV
+// output; the parser must tolerate it (and the wrapping quotes).
+const wktType = `^^<http://www.opengis.net/ont/geosparql#wktLiteral>`
+
+// tsvRow assembles one QLever TSV line: way IRI, (optional) highspeed value, WKT
+// literal — matching the exact tab layout the live endpoint emits.
+func tsvRow(iri, hs, wkt string) string {
+	return iri + "\t" + hs + "\t" + wkt + wktType
+}
+
+// TestParseQLeverTSV feeds parseQLeverTSV the exact TSV shape the live endpoint
+// returns and checks the things a real bug would break: the WKT lon-lat order
+// (the most damaging mistake), the highspeed flag wiring, closed-loop POLYGON
+// handling, and that geometries which can't form an edge are dropped.
+func TestParseQLeverTSV(t *testing.T) {
+	tsv := strings.Join([]string{
+		"?way\t?hs\t?wkt",
+		tsvRow(`<https://www.openstreetmap.org/way/1>`, `"yes"`, `"LINESTRING(120.2843646 22.9286472,120.29 22.93)"`),
+		tsvRow(`<https://www.openstreetmap.org/way/2>`, ``, `"LINESTRING(120.2124822 22.9945708,120.213 22.995)"`),
+		tsvRow(`<https://www.openstreetmap.org/way/3>`, ``, `"POLYGON((120.371409 23.328,120.372 23.329,120.371409 23.328))"`),
+		tsvRow(`<https://www.openstreetmap.org/way/4>`, ``, `"LINESTRING(120.0 22.0)"`), // single point — unroutable
+		tsvRow(`<https://www.openstreetmap.org/node/5>`, ``, `"POINT(120.0 22.0)"`),     // stray node — not a way
+		"",
+	}, "\n")
+
+	resp, err := parseQLeverTSV(strings.NewReader(tsv))
+	if err != nil {
+		t.Fatalf("parseQLeverTSV: %v", err)
+	}
+	if len(resp.Elements) != 3 {
+		t.Fatalf("got %d elements, want 3 (single-point and POINT rows must be dropped)", len(resp.Elements))
+	}
+
+	// WKT is X Y, so 120.28 is longitude and 22.93 latitude. A swap would put
+	// ~120 into Lat (impossible) and silently route garbage — assert the mapping.
+	p := resp.Elements[0].Geometry[0]
+	if math.Abs(p.Lat-22.9286472) > 1e-7 || math.Abs(p.Lon-120.2843646) > 1e-7 {
+		t.Fatalf("lon/lat parsed wrong: got lat=%.7f lon=%.7f, want lat=22.9286472 lon=120.2843646", p.Lat, p.Lon)
+	}
+
+	if resp.Elements[0].Tags["highspeed"] != "yes" {
+		t.Fatalf("first way should carry highspeed=yes, got tags %v", resp.Elements[0].Tags)
+	}
+	if _, ok := resp.Elements[1].Tags["highspeed"]; ok {
+		t.Fatalf("second way has an empty highspeed column but got a tag: %v", resp.Elements[1].Tags)
+	}
+	if n := len(resp.Elements[2].Geometry); n != 3 {
+		t.Fatalf("POLYGON loop should parse to 3 points, got %d", n)
+	}
+
+	// The parsed result must flow through buildGraph and mark the high-speed
+	// edge, since that flag drives the routing discount downstream.
+	g := buildGraph(resp)
+	if !g.nearestHighspeedNodeExists() {
+		t.Fatal("buildGraph produced no high-speed node from a highspeed=yes way")
+	}
+}
+
+// nearestHighspeedNodeExists reports whether any node in the graph lies on a
+// high-speed edge — a tiny test shim over nodeIsHighspeed.
+func (g graph) nearestHighspeedNodeExists() bool {
+	for n := range g {
+		if g.nodeIsHighspeed(n) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestBridgeOnlyEndpoints locks the fix for the density blow-up that made dense
+// metros unroutable: bridgeNearby must connect way *endpoints* across a junction
+// gap, but must NOT cross-link interior nodes of parallel tracks that merely run
+// within tolerance — doing so inflated node degree into the hundreds and made
+// the turn-aware search take minutes.
+func TestBridgeOnlyEndpoints(t *testing.T) {
+	// Two parallel north-south ways ~91 m apart (0.001° lon), each with a shared
+	// interior node latitude so their interiors sit within bridgeToleranceM.
+	wayA := wayElem([2]float64{0, 0}, [2]float64{0.005, 0}, [2]float64{0.01, 0})
+	wayB := wayElem([2]float64{0, 0.001}, [2]float64{0.005, 0.001}, [2]float64{0.01, 0.001})
+	g := testGraph(wayA, wayB)
+
+	// The interior node of A must keep degree 2 (its two way-neighbours) — never
+	// bridged sideways to B's parallel interior node.
+	interiorA := keyOf(0.005, 0)
+	if d := len(g[interiorA]); d != 2 {
+		t.Fatalf("interior node degree %d, want 2 — parallel track was cross-bridged", d)
+	}
+	if hasEdge(g[interiorA], keyOf(0.005, 0.001)) {
+		t.Fatal("interior node bridged to the parallel track — bridgeNearby must skip interior nodes")
+	}
+
+	// But a genuine end-to-end junction gap must still bridge: two collinear ways
+	// whose endpoints are ~111 m apart (distinct coords) must route through.
+	seg1 := wayElem([2]float64{0, 0}, [2]float64{0, 0.001})
+	seg2 := wayElem([2]float64{0, 0.002}, [2]float64{0, 0.003}) // 0.001° (~111 m) gap
+	g2 := testGraph(seg1, seg2)
+	if _, _, err := dijkstra(g2, keyOf(0, 0), keyOf(0, 0.003), false); err != nil {
+		t.Fatalf("endpoint gap should be bridged, but routing failed: %v", err)
+	}
+}
+
+// TestParseQLeverTSVEmpty: a bbox with no rail returns a header-only TSV. That
+// must surface as an error, not an empty network, so FetchRailNetwork falls
+// through to the Overpass fallback instead of reporting a spurious empty result.
+func TestParseQLeverTSVEmpty(t *testing.T) {
+	if _, err := parseQLeverTSV(strings.NewReader("?way\t?hs\t?wkt\n")); err == nil {
+		t.Fatal("header-only response should error so the Overpass fallback runs")
+	}
 }
